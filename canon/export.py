@@ -213,6 +213,7 @@ def sidecar(ir: Mapping[str, Any], *, style: str, render_report: Mapping[str, An
         ],
         "render": dict(render_report),
         "checks": list(checks),
+        **({"cast_binding": dict(ir["cast_binding"])} if ir.get("cast_binding") else {}),
     }
 
 

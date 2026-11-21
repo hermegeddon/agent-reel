@@ -98,6 +98,16 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     plan.add_argument("--harness-root", action="append", default=[], metavar="NAME=PATH",
                       help="where a harness keeps its logs, e.g. codex=~/.codex/sessions")
     plan.add_argument("--mapping", default="", help="jsonl harness: mapping file (glob + field paths)")
+    plan.add_argument(
+        "--cast-config",
+        default="",
+        help="opt-in versioned series cast JSON (maps owner and harness/profile roles to character kits)",
+    )
+    plan.add_argument(
+        "--assets-dir",
+        default="",
+        help="directory holding user character kits (overrides cast config assets_dir and --data-dir)",
+    )
     plan.add_argument("--tone", default="",
                       help="story tone: witty, comical, serious, quirky, epic, wholesome, noir; blend with + "
                            "(comical+serious) or weights (comical:70,serious:30); or auto (default: saved choice, else witty)")
@@ -197,13 +207,14 @@ def _tone_choice(args: argparse.Namespace) -> str:
     return value
 
 
-def _kit_voices() -> dict[str, str]:
+def _kit_voices(assets_dir: Path | None = None) -> dict[str, str]:
     """Voices from built-in and user character kits (V11)."""
     try:
         from canon.assets import load_kits
 
         repo = Path(__file__).resolve().parents[2]
-        kits = load_kits(repo / "kits", _default_data_dir() / "kits")
+        root = assets_dir or _default_data_dir()
+        kits = load_kits(repo / "kits", root / "kits")
     except Exception:  # noqa: BLE001 - voices are optional
         return {}
     return {kit.name: kit.voice for kit in kits.values() if kit.voice}
@@ -280,6 +291,30 @@ def reel_command(args: argparse.Namespace) -> int:
     from adapters.hermes.plugin_llm import PluginLLMClient
 
     data_dir = Path(args.data_dir).expanduser() if args.data_dir else _default_data_dir()
+    assets_dir_raw = str(getattr(args, "assets_dir", "") or "").strip()
+    assets_dir_arg: Path | None = Path(assets_dir_raw).expanduser() if assets_dir_raw else None
+    cast_config_raw = str(getattr(args, "cast_config", "") or "").strip()
+    cast_config_arg: Path | None = Path(cast_config_raw).expanduser() if cast_config_raw else None
+    builtin_kits_dir = Path(__file__).resolve().parents[2] / "kits"
+
+    resolved_assets_dir = assets_dir_arg
+    if cast_config_arg is not None:
+        from adapters.hermes.pipeline import validate_cast_setup
+        from canon.series_cast import CastConfigError
+
+        try:
+            cast_cfg, _kits = validate_cast_setup(
+                cast_config_arg,
+                data_dir=data_dir,
+                assets_dir=assets_dir_arg,
+                builtin_kits_dir=builtin_kits_dir,
+            )
+        except CastConfigError as exc:
+            print(f"invalid cast config: {exc}")
+            return 2
+        if resolved_assets_dir is None and cast_cfg is not None:
+            resolved_assets_dir = cast_cfg.assets_dir or data_dir
+
     # V4: a chapter needs about twice the writer calls of a strip per story tried.
     writer = PluginLLMClient(llm, max_calls=300 if getattr(args, "format", "strip") == "chapter" else 150)
     # Redaction is deterministic by default (regex + alias book, nothing leaves the
@@ -313,13 +348,16 @@ def reel_command(args: argparse.Namespace) -> int:
         harnesses=tuple(h.strip() for h in str(getattr(args, "harness", "hermes")).split(",") if h.strip()),
         harness_options=_harness_options(args),
         all_profiles=bool(getattr(args, "all_profiles", False)),
-        voices=_kit_voices(),
+        voices=_kit_voices(resolved_assets_dir),
         tone=_tone_choice(args),
         episodes=max(1, args.episodes),
         max_deep_events=args.max_deep_events,
         use_model=True,
         llm=local,
         writer_llm=writer,
+        cast_config=cast_config_arg,
+        assets_dir=resolved_assets_dir,
+        builtin_kits_dir=builtin_kits_dir if cast_config_arg is not None else None,
     )
     result = run_pipeline(config)
 
@@ -330,6 +368,11 @@ def reel_command(args: argparse.Namespace) -> int:
     print(f"writer: ctx.llm, {usage['calls']} calls, {usage['prompt_tokens']} prompt tokens, "
           f"{usage['completion_tokens']} completion tokens, "
           f"max {usage['max_prompt_tokens_per_call']} prompt tokens in one call")
+    cast_diags = list(getattr(result, "cast_diagnostics", ()) or ())
+    if cast_diags:
+        print("cast diagnostics (local only):")
+        for diag in cast_diags:
+            print(f"  - {diag}")
     if result.problems:
         print("problems:")
         for problem in result.problems:

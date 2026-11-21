@@ -144,7 +144,7 @@ def _verb_for(event: GatedEvent) -> str:
 
 def _actor_for(event: GatedEvent, display: Mapping[str, str], hero: str) -> str:
     role = str((event.payload or {}).get("role") or "").lower()
-    if role == "user" or event.actor == "owner":
+    if role == "user" or event.actor == "owner" or (hero and event.actor == hero):
         return display.get("owner") or hero
     for key in (event.profile, event.actor):
         mapped = display.get(key or "")

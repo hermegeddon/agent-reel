@@ -42,6 +42,8 @@ def request_key(request: PanelRequest) -> str:
     digest = hashlib.sha256()
     digest.update(request.prompt.encode("utf-8"))
     digest.update(request.aspect.encode("utf-8"))
+    for name, slug in sorted(request.bindings.items()):
+        digest.update(f"{name}={slug}\0".encode("utf-8"))
     for ref in request.references:
         digest.update(hashlib.sha256(Path(ref).read_bytes()).digest())
     return digest.hexdigest()
@@ -137,6 +139,7 @@ def write_render_manifest(path: Path, requests: Sequence[PanelRequest], report: 
                 "prompt": request.prompt,
                 "references": [str(ref) for ref in request.references],
                 "cast": list(request.cast),
+                **({"bindings": dict(request.bindings)} if request.bindings else {}),
                 "positions": dict(request.positions),
                 "aspect": request.aspect,
             }

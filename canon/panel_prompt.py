@@ -13,7 +13,7 @@ The caption is post-gate text. It is passed as scene context so the picture show
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -61,6 +61,7 @@ class PanelRequest:
     cast: tuple[str, ...]
     positions: Mapping[str, str]
     aspect: str
+    bindings: Mapping[str, str] = field(default_factory=dict)
 
 
 def _kit_for(name: str, kits: Mapping[str, CharacterKit]) -> CharacterKit | None:
@@ -91,6 +92,7 @@ def build_panel_request(
     *,
     style: StyleCard,
     kits: Mapping[str, CharacterKit],
+    bound_kits: Mapping[str, CharacterKit] | None = None,
     aspect: str = "landscape",
     treatment: Any = None,
     villain: Any = None,
@@ -101,9 +103,14 @@ def build_panel_request(
         raise PromptError(f"panel {panel.get('id')} has {len(cast)} characters; at most {len(POSITIONS)}")
     resolved: list[tuple[str, CharacterKit]] = []
     for name in cast:
-        kit = _kit_for(name, kits)
-        if kit is None:
-            raise PromptError(f"panel {panel.get('id')}: no character kit for {name!r}")
+        if bound_kits is not None:
+            kit = bound_kits.get(name)
+            if kit is None:
+                raise PromptError(f"panel {panel.get('id')}: no bound character kit for {name!r}")
+        else:
+            kit = _kit_for(name, kits)
+            if kit is None:
+                raise PromptError(f"panel {panel.get('id')}: no character kit for {name!r}")
         resolved.append((name, kit))
 
     positions = {name: POSITIONS[index] for index, (name, _kit) in enumerate(resolved)}
@@ -212,6 +219,7 @@ def build_panel_request(
         cast=tuple(name for name, _kit in resolved) + ((villain[0],) if villain_shown else ()),
         positions=positions,
         aspect=aspect,
+        bindings={name: kit.key for name, kit in resolved} if bound_kits is not None else {},
     )
 
 
@@ -220,10 +228,21 @@ def build_episode_requests(
     *,
     style: StyleCard,
     kits: Mapping[str, CharacterKit],
+    bound_kits: Mapping[str, CharacterKit] | None = None,
     treatment: Any = None,
     villain: Any = None,
 ) -> tuple[list[PanelRequest], list[str]]:
     """Requests for every panel, plus the reasons any panel could not be prompted."""
+    if bound_kits is None and "cast_binding" in ir and ir["cast_binding"] is not None:
+        from canon.series_cast import resolve_bound_kits
+
+        resolved_kits, binding_problems = resolve_bound_kits(
+            ir["cast_binding"], episode_cast(ir), kits
+        )
+        if binding_problems:
+            return [], binding_problems
+        bound_kits = resolved_kits
+
     requests: list[PanelRequest] = []
     problems: list[str] = []
     by_id = {str(p.get("id")): p for p in ir.get("panels", []) or []}
@@ -235,7 +254,7 @@ def build_episode_requests(
         panel = by_id.get(pid) or filler_panel(item)
         try:
             requests.append(build_panel_request(
-                panel, style=style, kits=kits, treatment=item, villain=villain,
+                panel, style=style, kits=kits, bound_kits=bound_kits, treatment=item, villain=villain,
                 aspect=panel_aspect(str(panel.get("role", ""))) if treatment is not None else "landscape",
             ))
         except PromptError as exc:

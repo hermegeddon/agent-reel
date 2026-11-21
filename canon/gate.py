@@ -102,6 +102,32 @@ def seal(event: Event, payload_redacted: Mapping[str, Any]) -> GatedEvent:
     )
 
 
+def recast_gated(
+    event: GatedEvent,
+    *,
+    profile: str,
+    actor: str,
+    subject: str | None = None,
+    payload: Mapping[str, Any] | None = None,
+    ref: Mapping[str, str] | None = None,
+) -> GatedEvent:
+    """Copy ``event`` with sanitized role/actor metadata while preserving the seal."""
+    return GatedEvent(
+        id=event.id,
+        ts=event.ts,
+        source=event.source,
+        kind=event.kind,
+        profile=profile,
+        actor=actor,
+        subject=event.subject if subject is None else subject,
+        privacy=event.privacy,
+        payload=dict(event.payload if payload is None else payload),
+        derived_from=event.derived_from,
+        ref=dict(event.ref if ref is None else ref),
+        _seal=_SEAL,
+    )
+
+
 def require_gated(events: Any, *, stage: str) -> list[GatedEvent]:
     """Type-check a sequence of gated events for a downstream stage."""
     if isinstance(events, GatedEvent):

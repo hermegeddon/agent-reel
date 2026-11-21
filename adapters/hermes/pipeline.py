@@ -40,6 +40,7 @@ from canon.arcs import build_arc, build_arcs, classify_arc_type, turn_texts
 from canon.beats import Beat, beats_from_events
 from canon.cache import ModelCache
 from canon.aliases import AliasBook, apply_to_ir, masks_in
+from canon.assets import load_kits
 from canon.canon import Canon, build_canon
 from canon.caption import compose_caption, trim_caption
 from canon.casting import build_cast_map, summarise as summarise_cast
@@ -54,10 +55,31 @@ from canon.episode import (
     validate_ir,
 )
 from canon.events import KIND_MESSAGE_ASSISTANT, KIND_MESSAGE_USER, Event
-from canon.gate import GatedEvent
+from canon.gate import GatedEvent, recast_gated
 from canon.grounding import ClaimGate
 from canon.llm import CachedLLM, LLMClient, NullLLM
+from canon.panel_prompt import episode_cast
 from canon.redact import DeterministicRedactor, ModelEntityGate, RedactionGate
+from canon.series import (
+    load as load_series,
+    order_for_series,
+    save as save_series,
+    series_file_for,
+    verify_series_compatibility,
+)
+from canon.series_cast import (
+    CastConfigError,
+    SeriesCastConfig,
+    build_cast_binding,
+    event_agent_role_key,
+    event_role_key,
+    is_unmapped_label,
+    load_cast_config,
+    opaque_role_id,
+    resolve_voices,
+    sanitize_profile_value,
+    validate_cast_kits,
+)
 from canon.source import Window
 from canon.threads import build_threads
 from canon.titling import write_title
@@ -85,6 +107,20 @@ DEFAULT_ALLOWLIST = (
     "Linux",
     "Turbofit",
     "Severian",
+    "ComfyUI",
+)
+
+#: Tools/platforms safe to allowlist in cast-configured runs without hardcoded legacy characters.
+NON_CAST_ALLOWLIST = (
+    "Hermes",
+    "Claude",
+    "Codex",
+    "GitHub",
+    "Discord",
+    "Telegram",
+    "Python",
+    "SQLite",
+    "Linux",
     "ComfyUI",
 )
 
@@ -166,6 +202,12 @@ class PipelineConfig:
     #: Where the private memory snapshot lives. Never the evidence folder (M1-F4).
     state_dir: Path | None = None
     llm: LLMClient | None = None
+    #: Opt-in versioned series cast configuration (file path or parsed SeriesCastConfig).
+    cast_config: SeriesCastConfig | Path | str | None = None
+    #: Asset root for kit lookup (overrides cast_config.assets_dir when set).
+    assets_dir: Path | None = None
+    #: Override built-in kits root (defaults to repository ``kits/``).
+    builtin_kits_dir: Path | None = None
 
 
 @dataclass
@@ -187,6 +229,7 @@ class PipelineResult:
     title: str = ""
     title_source: str = ""
     cast: list[dict[str, Any]] = field(default_factory=list)
+    cast_diagnostics: list[str] = field(default_factory=list)
     episodes: list[dict[str, Any]] = field(default_factory=list)
     llm_usage: dict[str, Any] = field(default_factory=dict)
     stories: list[dict[str, Any]] = field(default_factory=list)
@@ -246,7 +289,10 @@ def markdown_of(ir: EpisodeIR) -> str:
 
 
 def evidence_by_event(
-    gated: Iterable[GatedEvent], *, display: Mapping[str, str] | None = None
+    gated: Iterable[GatedEvent],
+    *,
+    display: Mapping[str, str] | None = None,
+    hero: str = "Sahil",
 ) -> dict[str, str]:
     """The gated text each event can ground a line with.
 
@@ -259,7 +305,7 @@ def evidence_by_event(
         # kind or the actor is repeating the record, not inventing.
         # R3-F4: no provenance in the evidence either - a model shown a record dump
         # writes one back. The structured sentence is the event's own fact.
-        composed = compose_caption(event, display=display)
+        composed = compose_caption(event, display=display, hero=hero)
         parts: list[str] = [composed] if composed else []
         text = event.payload.get("text")
         if isinstance(text, str) and text:
@@ -440,6 +486,155 @@ def _trim_arc(arc: Any, panels: int) -> Any:
     return replace(arc, roles=trimmed)
 
 
+def validate_cast_setup(
+    cast_config: SeriesCastConfig | Path | str | None,
+    *,
+    data_dir: Path,
+    assets_dir: Path | None = None,
+    builtin_kits_dir: Path | None = None,
+    redactor: DeterministicRedactor | None = None,
+    privacy: str = "private",
+) -> tuple[SeriesCastConfig | None, dict[str, Any]]:
+    """Validate opt-in cast config, kits, display names, and series ledger before any model call."""
+    if cast_config is None:
+        return None, {}
+    if redactor is None:
+        rule_set = list(rules_from_snapshot())
+        if privacy == "public":
+            rule_set.extend(public_rules())
+        redactor = DeterministicRedactor(rule_set)
+    cast_cfg = (
+        cast_config
+        if isinstance(cast_config, SeriesCastConfig)
+        else load_cast_config(cast_config)
+    )
+    resolved_assets = assets_dir or cast_cfg.assets_dir or data_dir
+    builtin_kits = builtin_kits_dir or (Path(__file__).resolve().parents[2] / "kits")
+    user_kits = resolved_assets / "kits"
+    kits = load_kits(builtin_kits, user_kits)
+    validate_cast_kits(cast_cfg, kits, user_kits_dir=user_kits)
+    for name in cast_cfg.all_display_names():
+        if redactor.findings(name):
+            raise CastConfigError(f"configured character name {name!r} triggers redaction rules")
+    series_path = series_file_for(data_dir, cast_cfg.series_id)
+    verify_series_compatibility(
+        load_series(series_path),
+        series_id=cast_cfg.series_id,
+        cast_digest=cast_cfg.cast_digest,
+    )
+    return cast_cfg, kits
+
+
+def _resolve_cast_setup(
+    config: PipelineConfig,
+    redactor: DeterministicRedactor,
+) -> tuple[SeriesCastConfig | None, dict[str, Any]]:
+    return validate_cast_setup(
+        config.cast_config,
+        data_dir=config.data_dir,
+        assets_dir=config.assets_dir,
+        builtin_kits_dir=config.builtin_kits_dir,
+        redactor=redactor,
+        privacy=getattr(config, "privacy", "private"),
+    )
+
+
+def _sanitize_gated_event(
+    sealed: GatedEvent,
+    actor_role: str,
+    agent_role: str,
+    cast_cfg: SeriesCastConfig,
+) -> GatedEvent:
+    """Replace raw profile/actor metadata on a gated event with safe display names or opaque labels."""
+    if agent_role:
+        agent_member = cast_cfg.member_for_role(agent_role)
+        profile_label = agent_member.name if agent_member is not None else opaque_role_id(agent_role)
+    else:
+        profile_label = ""
+
+    if actor_role == "owner":
+        actor_label = cast_cfg.owner.name
+    elif actor_role:
+        actor_member = cast_cfg.member_for_role(actor_role)
+        actor_label = actor_member.name if actor_member is not None else opaque_role_id(actor_role)
+    else:
+        actor_label = sealed.actor
+
+    payload = dict(sealed.payload)
+    for field_name in ("assignee", "profile", "created_by", "author"):
+        raw_val = payload.get(field_name)
+        if isinstance(raw_val, str) and raw_val.strip():
+            payload[field_name] = sanitize_profile_value(raw_val, cast_cfg)
+
+    ref = dict(sealed.ref)
+    store = ref.get("store", "")
+    if isinstance(store, str) and store.startswith("profile:"):
+        ref["store"] = f"profile:{profile_label or opaque_role_id(agent_role or store)}"
+
+    subject = sealed.subject
+    if sealed.kind == "kanban.run.started" and profile_label:
+        subject = profile_label
+    elif sealed.kind == "kanban.comment" and actor_label:
+        subject = actor_label
+
+    return recast_gated(
+        sealed,
+        profile=profile_label,
+        actor=actor_label,
+        subject=subject,
+        payload=payload,
+        ref=ref,
+    )
+
+
+def _sanitize_memory_key(key: str, cast_cfg: SeriesCastConfig) -> str:
+    """Replace profile directory prefixes in memory snapshot keys."""
+    prof, sep, filename = key.partition("/")
+    if not sep:
+        return key
+    safe_prof = sanitize_profile_value(prof, cast_cfg)
+    return f"{safe_prof}{sep}{filename}"
+
+
+def _sanitize_memory_hashes(
+    hashes: Mapping[str, list[str]],
+    cast_cfg: SeriesCastConfig,
+) -> dict[str, list[str]]:
+    """Replace profile directory prefixes in ``memory.json`` hash keys."""
+    return {
+        _sanitize_memory_key(key, cast_cfg): list(values)
+        for key, values in hashes.items()
+    }
+
+
+def _sanitize_memory_counts(
+    counts: Mapping[str, Any],
+    cast_cfg: SeriesCastConfig,
+) -> dict[str, Any]:
+    """Replace profile directory prefixes inside ``memory.json`` / ``metrics.json`` counts."""
+    out = dict(counts)
+    raw_per_file = counts.get("per_file")
+    if isinstance(raw_per_file, Mapping):
+        per_file: dict[str, int] = {}
+        for key, value in raw_per_file.items():
+            safe_key = _sanitize_memory_key(str(key), cast_cfg)
+            per_file[safe_key] = per_file.get(safe_key, 0) + int(value)
+        out["per_file"] = per_file
+    return out
+
+
+def _primary_agent_for_episode(participating: set[str], cast_cfg: SeriesCastConfig) -> str:
+    """Choose the primary mapped agent name for story panel jobs."""
+    if "hermes:default" in participating and "hermes:default" in cast_cfg.roles:
+        return cast_cfg.roles["hermes:default"].name
+    for role_key in sorted(participating):
+        if role_key != "owner" and role_key in cast_cfg.roles:
+            return cast_cfg.roles[role_key].name
+    if "hermes:default" in cast_cfg.roles:
+        return cast_cfg.roles["hermes:default"].name
+    return cast_cfg.owner.name
+
+
 def run_pipeline(
     config: PipelineConfig,
     *,
@@ -448,6 +643,13 @@ def run_pipeline(
     result = PipelineResult()
     started = time.time()
     config.data_dir.mkdir(parents=True, exist_ok=True)
+
+    rule_set = list(rules_from_snapshot())
+    if getattr(config, "privacy", "private") == "public":
+        rule_set.extend(public_rules())
+    redactor = DeterministicRedactor(rule_set)
+    cast_cfg, loaded_kits = _resolve_cast_setup(config, redactor)
+    effective_hero = cast_cfg.owner.name if cast_cfg is not None else config.hero
 
     own_source = source is None
     snapshot_store = SnapshotStore(config.state_dir)
@@ -520,7 +722,12 @@ def run_pipeline(
         result.timings["text_s"] = round(time.time() - started, 2)
 
         # ---- gate: deterministic + vocabulary ----------------------------
-        cache = ModelCache(config.data_dir / "cache")
+        cache_dir = (
+            config.data_dir / "cache" / f"cast-{cast_cfg.series_id}-{cast_cfg.cast_digest}"
+            if cast_cfg is not None
+            else config.data_dir / "cache"
+        )
+        cache = ModelCache(cache_dir)
         # Never construct a model route on the caller's behalf: a run that was given no
         # client is the deterministic path, so nothing reaches an endpoint the operator
         # did not name.
@@ -535,13 +742,17 @@ def run_pipeline(
             else cached
         )
 
-        rule_set = list(rules_from_snapshot())
-        if getattr(config, "privacy", "private") == "public":
-            rule_set.extend(public_rules())
-        redactor = DeterministicRedactor(rule_set)
         # Agent/profile names are the cast, not internal projects: keep them out of the
         # learned-sensitive vocabulary or every character turns into "Agent N".
-        cast_allowlist = tuple(sorted({*config.allowlist, *(p.name for p in source.info().profiles)}))
+        # For cast-configured runs, never allowlist raw directory/profile IDs.
+        if cast_cfg is not None:
+            cast_allowlist = tuple(sorted({*NON_CAST_ALLOWLIST, *cast_cfg.all_display_names()}))
+            actor_role_by_id = {event.id: event_role_key(event) for event in events}
+            agent_role_by_id = {event.id: event_agent_role_key(event) for event in events}
+        else:
+            cast_allowlist = tuple(sorted({*config.allowlist, *(p.name for p in source.info().profiles)}))
+            actor_role_by_id = {}
+            agent_role_by_id = {}
         model_gate = (
             # No model client, no model pass: without a named route redaction is the
             # deterministic regex pass only, rather than a gate that fails closed on
@@ -558,8 +769,27 @@ def run_pipeline(
             max_chars=config.max_text_chars,
         )
 
+        if cast_cfg is not None:
+            mapped_roles = {"", "owner"} | set(cast_cfg.roles)
+
+            def _is_mapped_event(event_id: str) -> bool:
+                return (
+                    actor_role_by_id.get(event_id, "") in mapped_roles
+                    and agent_role_by_id.get(event_id, "") in mapped_roles
+                )
+        else:
+
+            def _is_mapped_event(event_id: str) -> bool:
+                return True
+
         if model_gate is not None and texts:
-            gate.learn_vocabulary(texts.values(), max_candidates=config.max_vocabulary)
+            vocab_texts = (
+                [text for eid, text in texts.items() if _is_mapped_event(eid)]
+                if cast_cfg is not None
+                else texts.values()
+            )
+            if vocab_texts:
+                gate.learn_vocabulary(vocab_texts, max_candidates=config.max_vocabulary)
         result.timings["vocabulary_s"] = round(time.time() - started, 2)
 
         gated: list[GatedEvent] = []
@@ -567,6 +797,13 @@ def run_pipeline(
         for event in events:
             sealed = gate.gate_event(event, text=texts.get(event.id))
             if sealed is not None:
+                if cast_cfg is not None:
+                    sealed = _sanitize_gated_event(
+                        sealed,
+                        actor_role_by_id.get(sealed.id, ""),
+                        agent_role_by_id.get(sealed.id, ""),
+                        cast_cfg,
+                    )
                 gated.append(sealed)
                 gated_by_id[sealed.id] = sealed
         result.gated = gate.report.gated
@@ -588,10 +825,20 @@ def run_pipeline(
                 if event.id not in deep_ids:
                     upgraded.append(existing)
                     continue
+                if cast_cfg is not None and not _is_mapped_event(event.id):
+                    upgraded.append(existing)
+                    continue
                 sealed = gate.gate_event(event, text=texts.get(event.id), deep=True)
                 if sealed is None:
                     # Quarantined at the deeper level: drop it from the story.
                     continue
+                if cast_cfg is not None:
+                    sealed = _sanitize_gated_event(
+                        sealed,
+                        actor_role_by_id.get(sealed.id, ""),
+                        agent_role_by_id.get(sealed.id, ""),
+                        cast_cfg,
+                    )
                 upgraded.append(sealed)
             gated = [item for item in upgraded if item is not None]
             gated_by_id = {item.id: item for item in gated}
@@ -623,20 +870,59 @@ def run_pipeline(
         )
         result.threads = len(threads)
         result.arc_count = len(arcs)
-        canon = build_canon(gated, beats, hero_names=(config.hero,), window_start=window.since)
+        canon = build_canon(gated, beats, hero_names=(effective_hero,), window_start=window.since)
         result.canon = canon
 
         if not arcs:
             result.problems.append("no arc could be built from this window")
             return result
 
-        cast = [config.hero] + sorted(
-            {
-                beat.profile
-                for beat in beats
-                if beat.profile and beat.profile != config.hero
+        # Round 3 item 3: a script never shows a redaction marker. Every masked value
+        # gets a stable fictional alias from the private alias book.
+        alias_book = AliasBook.load(snapshot_store.root / "aliases.json")
+        if cast_cfg is not None:
+            cast_map = {"owner": effective_hero}
+            for name in cast_cfg.all_display_names():
+                cast_map[name] = name
+            cast = list(dict.fromkeys([effective_hero, *cast_cfg.all_display_names()]))
+            result.cast = cast_cfg.summary_entries()
+            extra_allow = tuple(
+                word for name in cast_cfg.all_display_names() for word in name.split() if word
+            )
+            claim_allow = tuple(dict.fromkeys(tuple(cast_allowlist) + extra_allow + (effective_hero,)))
+            claim_cast = tuple(dict.fromkeys(cast_cfg.all_display_names() + (effective_hero,)))
+        else:
+            cast = [effective_hero] + sorted(
+                {
+                    beat.profile
+                    for beat in beats
+                    if beat.profile and beat.profile != effective_hero
+                }
+            )
+            # Audit M1-F6: profiles are characters, not database ids.
+            cast_map = build_cast_map(
+                [beat.profile for beat in beats if beat.profile],
+                hero=effective_hero,
+            )
+            cast_map["default"] = cast_map.get("default", "Kensei")
+            # R4-F1: the owner is a character in his own story, and no one is called "Assistant".
+            cast_map["owner"] = effective_hero
+            cast_map = {
+                profile: character
+                for profile, character in cast_map.items()
+                if character.strip().lower() not in {"assistant", "default", "agent", ""}
             }
-        )
+            # A character name is released in the evidence, so it must survive the gate:
+            # a profile whose name matches a learned sensitive term gets a neutral alias.
+            safe_cast: dict[str, str] = {}
+            for index, (profile, character) in enumerate(sorted(cast_map.items()), start=1):
+                redacted, findings = gate.redact_text(character)
+                safe_cast[profile] = character if not findings else f"Agent {index}"
+            cast_map = safe_cast
+            result.cast = summarise_cast(cast_map)
+            claim_allow = tuple(cast_map.values()) + tuple(config.allowlist) + (effective_hero,)
+            claim_cast = tuple(dict.fromkeys(tuple(cast_map.values()) + (effective_hero,)))
+
         writer: Any
         if config.writer is not None:
             writer = config.writer
@@ -645,53 +931,42 @@ def run_pipeline(
         else:
             # Round 8 / R7-F1: captions are written prose. With no model there is no
             # writer, so the run produces no strip and reports why.
-            writer = TemplateDialogueWriter(cast, hero=config.hero)
-
-        # Round 3 item 3: a script never shows a redaction marker. Every masked value
-        # gets a stable fictional alias from the private alias book.
-        alias_book = AliasBook.load(snapshot_store.root / "aliases.json")
-        # Audit M1-F6: profiles are characters, not database ids.
-        cast_map = build_cast_map(
-            [beat.profile for beat in beats if beat.profile],
-            hero=config.hero,
-        )
-        cast_map["default"] = cast_map.get("default", "Kensei")
-        # R4-F1: the owner is a character in his own story, and no one is called "Assistant".
-        cast_map["owner"] = config.hero
-        cast_map = {
-            profile: character
-            for profile, character in cast_map.items()
-            if character.strip().lower() not in {"assistant", "default", "agent", ""}
-        }
-        # A character name is released in the evidence, so it must survive the gate:
-        # a profile whose name matches a learned sensitive term gets a neutral alias.
-        safe_cast: dict[str, str] = {}
-        for index, (profile, character) in enumerate(sorted(cast_map.items()), start=1):
-            redacted, findings = gate.redact_text(character)
-            safe_cast[profile] = character if not findings else f"Agent {index}"
-        cast_map = safe_cast
-        result.cast = summarise_cast(cast_map)
+            writer = TemplateDialogueWriter(cast, hero=effective_hero)
 
         # Audit M1-F1 + round 3: claims in both layers must be supported by the gated
         # content of the events the line cites.
         grounder = ClaimGate(
             writer_cached if config.use_model else None,
-            allow=tuple(cast_map.values()) + tuple(config.allowlist) + (config.hero,),
+            allow=claim_allow,
             # r10b / QAR10-01: a caption naming a character must find that name in its
             # cited evidence; the allowlist only makes the name legal vocabulary.
-            cast=tuple(dict.fromkeys(tuple(cast_map.values()) + (config.hero,))),
+            cast=claim_cast,
             meaning=config.wording == "meaning",
         )
         # Who did what: only an actor of a cited event may speak its panel (R2-F2).
         actors_by_event: dict[str, str] = {}
         for event in gated:
+            if cast_cfg is not None:
+                a_role = actor_role_by_id.get(event.id, "")
+                g_role = agent_role_by_id.get(event.id, "")
+                if is_unmapped_label(event.actor) or is_unmapped_label(event.profile):
+                    actors_by_event[event.id] = ""
+                elif a_role == "owner":
+                    actors_by_event[event.id] = effective_hero
+                elif a_role and a_role in cast_cfg.roles:
+                    actors_by_event[event.id] = cast_cfg.roles[a_role].name
+                elif g_role and g_role in cast_cfg.roles:
+                    actors_by_event[event.id] = cast_cfg.roles[g_role].name
+                else:
+                    actors_by_event[event.id] = ""
+                continue
             # Prefer the profile: on message events the actor is a tool name, and a tool
             # cannot speak. Fall back to the actor only when it is a known character.
             # QAR-M2-01: the owner's own messages belong to the owner, whichever profile ran.
-            who = config.hero if event.actor == "owner" else (cast_map.get(event.profile) or cast_map.get(event.actor) or "")
+            who = effective_hero if event.actor == "owner" else (cast_map.get(event.profile) or cast_map.get(event.actor) or "")
             actors_by_event[event.id] = who
 
-        evidence_map = evidence_by_event(gated, display=cast_map)
+        evidence_map = evidence_by_event(gated, display=cast_map, hero=effective_hero)
         # The gated text of each message: the pool the script's real lines are drawn from.
         # Gated means redacted; nothing here comes from raw history.
         quotes_by_event: dict[str, str] = {}
@@ -704,9 +979,9 @@ def run_pipeline(
                     and text.strip()
                 ):
                     quotes_by_event[event.id] = text
-        cast_names = tuple(dict.fromkeys(tuple(cast_map.values()) + (config.hero,)))
+        cast_names = tuple(dict.fromkeys(tuple(cast_map.values()) + (effective_hero,)))
         structured_captions = {
-            event.id: compose_caption(event, display=cast_map, hero=config.hero)
+            event.id: compose_caption(event, display=cast_map, hero=effective_hero)
             for event in gated
         }
 
@@ -741,17 +1016,9 @@ def run_pipeline(
         skipped: list[dict[str, str]] = []
         used_anchors: set[str] = set()
         used_arcs: set[str] = set()
-        # M3: the series ledger. Continuity first, no story told twice, a frame per chapter.
-        from canon.series import (
-            SERIES_FILE,
-            load as load_series,
-            order_for_series,
-            save as save_series,
-        )
-
         from canon.ideas import draw as draw_frame
 
-        series_path = config.data_dir / SERIES_FILE
+        series_path = series_file_for(config.data_dir, cast_cfg.series_id if cast_cfg is not None else "")
         series = load_series(series_path)
         selected, series_skipped = order_for_series(selected, series)
         skipped.extend(series_skipped)
@@ -764,11 +1031,27 @@ def run_pipeline(
             if thread is None:
                 skipped.append({"key": candidate.key, "reason": "no thread for this story"})
                 continue
+            t_events = thread_events.get(thread.id, [])
+            participating: set[str] = set()
+            if cast_cfg is not None:
+                thread_ids_all = {ev.id for ev in t_events} | set(candidate.event_ids)
+                participating = (
+                    {actor_role_by_id.get(eid, "") for eid in thread_ids_all}
+                    | {agent_role_by_id.get(eid, "") for eid in thread_ids_all}
+                ) - {""}
+                unmapped = sorted(r for r in participating if r != "owner" and r not in cast_cfg.roles)
+                if unmapped:
+                    opaque = ", ".join(opaque_role_id(r) for r in unmapped)
+                    skipped.append({"key": candidate.key, "reason": f"unmapped participating role ({opaque})"})
+                    result.cast_diagnostics.append(
+                        f"candidate {candidate.key}: unmapped participating role(s): {', '.join(unmapped)}"
+                    )
+                    continue
             # R3-F2: the brief is the story spine, built from the thread's own text.
             brief = build_brief(
                 thread.key,
                 thread.kind,
-                thread_events.get(thread.id, []),
+                t_events,
                 gate=grounder if config.use_model else None,
                 max_turns=CHAPTER_MAX_TURNS if config.format == "chapter" else MAX_TURNS,
             )
@@ -824,12 +1107,12 @@ def run_pipeline(
             if brief.outcome:
                 for event in thread_events.get(thread.id, []):
                     if str((event.payload or {}).get("text", "")).strip() == brief.outcome.strip():
-                        outcome_caption = compose_caption(event, display=cast_map, hero=config.hero)
+                        outcome_caption = compose_caption(event, display=cast_map, hero=effective_hero)
                         break
                 if not outcome_caption:
                     outcome_caption = trim_caption(brief.outcome)
             thread_facts = build_facts(
-                brief, thread_event_map, display=cast_map, hero=config.hero
+                brief, thread_event_map, display=cast_map, hero=effective_hero
             )
             thread_facts_text = facts_text(thread_facts)
             thread_evidence_text = "\n".join(
@@ -849,7 +1132,7 @@ def run_pipeline(
                 writer_cached if config.use_model else None,
                 beats=story_beats or thread_beats,
                 derived=derived_title,
-                hero=config.hero,
+                hero=effective_hero,
                 gate=grounder,
                 evidence=brief.text(),
                 alias=alias_book.resolve,
@@ -864,7 +1147,7 @@ def run_pipeline(
             # M3: one frame per chapter - a different world/villain/genre/motif/shot, drawn
             # deterministically from the hero and the chapter number, avoiding recent looks.
             chapter_number = series.next_number + index - 1
-            frame = draw_frame(config.hero, chapter_number, avoid=series.avoid())
+            frame = draw_frame(effective_hero, chapter_number, avoid=series.avoid())
 
             def _plan(episode_writer: Any, layer: str = "caption") -> EpisodeIR:
                 return plan_episode(
@@ -875,7 +1158,7 @@ def run_pipeline(
                     season=config.season,
                     number=config.number + index - 1,
                     writer=episode_writer,
-                    hero=config.hero,
+                    hero=effective_hero,
                     grounder=grounder,
                     evidence=evidence_map,
                     brief=brief,
@@ -908,16 +1191,32 @@ def run_pipeline(
                     )
                     if synopsis.fields.get("title"):
                         # V6: a story title from the checked synopsis beats "A session".
-                        title, title_source = synopsis.fields["title"], "synopsis"
+                        title, title_source = alias_book.resolve(synopsis.fields["title"]), "synopsis"
                     from canon.tones import auto_tone, parse_tone
 
                     if str(config.tone).strip().lower() == "auto":
                         tone = auto_tone(drama=int(getattr(candidate, "drama", 0) or 0), finished=arc.status == "resolved")
                     else:
                         tone = parse_tone(config.tone)
-                    story_ctx = {"tone": tone.writer_text(), "voices": {**DEFAULT_VOICES, **dict(config.voices or {})},
-                                 "synopsis": synopsis.text(), "hook": synopsis.fields.get("hook", ""),
-                                 "jobs": jobs_for(arc.type, hero=config.hero, agent=cast_map.get("default") or "Kensei"), "notes": {}}
+                    merged_defaults = {**DEFAULT_VOICES, **dict(config.voices or {})}
+                    story_voices = (
+                        resolve_voices(cast_cfg, loaded_kits, merged_defaults)
+                        if cast_cfg is not None
+                        else merged_defaults
+                    )
+                    primary_agent = (
+                        _primary_agent_for_episode(participating, cast_cfg)
+                        if cast_cfg is not None
+                        else (cast_map.get("default") or "Kensei")
+                    )
+                    story_ctx = {
+                        "tone": tone.writer_text(),
+                        "voices": story_voices,
+                        "synopsis": synopsis.text(),
+                        "hook": synopsis.fields.get("hook", ""),
+                        "jobs": jobs_for(arc.type, hero=effective_hero, agent=primary_agent),
+                        "notes": {},
+                    }
                     first_writer = LLMDialogueWriter(writer_cached, cast, story=story_ctx)
                     # Story captions may interpret (stakes, feeling) but add no event, name
                     # or number; `--strict-captions` keeps them literal.
@@ -969,6 +1268,9 @@ def run_pipeline(
                 continue
             planned_ir = episode_ir  # pre-alias: the text the citations were ranked on
             episode_ir = apply_to_ir(episode_ir, alias_book)
+            if cast_cfg is not None:
+                ep_names = episode_cast(episode_ir.as_dict())
+                episode_ir = replace(episode_ir, cast_binding=build_cast_binding(cast_cfg, ep_names))
             stray = masks_in(markdown_of(episode_ir))
             if stray:
                 result.problems.append(
@@ -1023,11 +1325,18 @@ def run_pipeline(
         if ir is None:
             # Honest empty run: no story could be told, but the run still reports its
             # gate, its stories and its skips so the reason is visible.
+            if result.cast_diagnostics:
+                result.problems.append(
+                    "unmapped participating role stopped candidate episode(s); see local cast diagnostics"
+                )
             result.problems.append("no episode could be planned")
             result.episodes = []
             result.skipped_stories = skipped
             result.timings["episode_s"] = round(time.time() - started, 2)
             result.timings["writer"] = "none"
+        if cast_cfg is not None:
+            series.series_id = cast_cfg.series_id
+            series.cast_digest = cast_cfg.cast_digest
         save_series(series_path, series)
         result.episodes = [
             {key: value for key, value in row.items() if key not in {"ir", "planned_ir", "arc", "story_beats", "story", "fact_sources"}}
@@ -1035,7 +1344,8 @@ def run_pipeline(
         ]
         if ir is not None:
             result.grounding = dict(ir.grounding)
-            result.cast = summarise_cast(cast_map)
+            if cast_cfg is None:
+                result.cast = summarise_cast(cast_map)
             result.ir = ir
         result.timings["episode_s"] = round(time.time() - started, 2)
         result.llm_usage = {
@@ -1092,6 +1402,9 @@ def run_pipeline(
             snapshot_store.save(snapshot)
             memory_counts = snapshot.counts()
             memory_hashes = snapshot.hashes_by_file()
+            if cast_cfg is not None:
+                memory_counts = _sanitize_memory_counts(memory_counts, cast_cfg)
+                memory_hashes = _sanitize_memory_hashes(memory_hashes, cast_cfg)
         except Exception as exc:  # noqa: BLE001
             result.problems.append(f"memory snapshot failed: {type(exc).__name__}: {exc}")
 

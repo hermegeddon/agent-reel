@@ -505,15 +505,32 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
         return 2
 
     cast = episode_cast(ir)
-    from canon.panel_prompt import _kit_for  # same name resolution as the prompts
+    from canon.panel_prompt import _kit_for  # legacy name resolution when cast_binding is absent
 
-    cast_kits, missing = [], []
-    for name in cast:
-        kit = _kit_for(name, kits)
-        (cast_kits.append(kit) if kit else missing.append(name))
-    problems = [f"no character kit for {name!r} (add one with `hermes reel kit add`)" for name in missing]
-    problems += clear_to_render(style=style, kits=cast_kits, approvals=approvals, public=args.public,
-                                allow_untested_style=args.allow_untested_style or not getattr(args, "strict_styles", False))
+    bound_kits: dict[str, Any] | None = None
+    problems: list[str] = []
+    if "cast_binding" in ir and ir["cast_binding"] is not None:
+        from canon.series_cast import resolve_bound_kits
+
+        resolved_map, binding_problems = resolve_bound_kits(ir["cast_binding"], cast, kits)
+        bound_kits = resolved_map
+        cast_kits = [resolved_map[name] for name in cast if name in resolved_map]
+        problems.extend(binding_problems)
+    else:
+        cast_kits, missing = [], []
+        for name in cast:
+            kit = _kit_for(name, kits)
+            (cast_kits.append(kit) if kit else missing.append(name))
+        problems.extend(
+            f"no character kit for {name!r} (add one with `hermes reel kit add`)" for name in missing
+        )
+    problems += clear_to_render(
+        style=style,
+        kits=cast_kits,
+        approvals=approvals,
+        public=args.public,
+        allow_untested_style=args.allow_untested_style or not getattr(args, "strict_styles", False),
+    )
     if not style.tested:
         print(f"style: {style.key!r} carries no bake-off record for this image source — panels are drawn fresh, nothing cached")
     if problems:
@@ -586,14 +603,19 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
             print(f"warning: no sheet for villain {treatment.villain_name!r}; panels drawn without it")
 
     letter_look = LetterStyle.from_style(style.lettering)
-    requests, prompt_problems = build_episode_requests(ir, style=style, kits=kits, treatment=treatment, villain=villain)
+    requests, prompt_problems = build_episode_requests(
+        ir, style=style, kits=kits, bound_kits=bound_kits, treatment=treatment, villain=villain
+    )
     if prompt_problems:
         for problem in prompt_problems:
             print(f"  - {problem}")
         return 1
 
     ask = host_vision(dispatch)
-    descriptions = {name: getattr(_kit_for(name, kits), "description", "") for name in cast}
+    if bound_kits is not None:
+        descriptions = {name: getattr(bound_kits.get(name), "description", "") for name in cast}
+    else:
+        descriptions = {name: getattr(_kit_for(name, kits), "description", "") for name in cast}
     if villain is not None:
         descriptions[villain[0]] = f"a villain creature: {villain[1]} (not a person)"
     panels_by_id = {p.get("id"): p for p in ir.get("panels", [])}

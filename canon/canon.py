@@ -190,10 +190,12 @@ def build_canon(
         hero = canon.entity("hero", name, voice="dry, fast, wants the thing shipped")
     canon.entity("place", "the rig", voice="two 3090s, a lot of terminals")
 
+    from canon.series_cast import is_unmapped_label
+
     profile_counts: dict[str, int] = {}
     tool_counts: dict[str, int] = {}
     for event in gated:
-        if event.profile:
+        if event.profile and not is_unmapped_label(event.profile):
             profile_counts[event.profile] = profile_counts.get(event.profile, 0) + 1
         if event.kind == KIND_TOOL_CALL:
             tool = str(event.payload.get("tool", ""))
@@ -207,7 +209,7 @@ def build_canon(
     # Facts per agent, each carrying the events that support it.
     per_agent_events: dict[str, list[GatedEvent]] = {}
     for event in gated:
-        if event.profile:
+        if event.profile and not is_unmapped_label(event.profile):
             per_agent_events.setdefault(event.profile, []).append(event)
     for profile, entity in agents.items():
         events_for_agent = per_agent_events.get(profile, [])

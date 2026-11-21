@@ -132,6 +132,8 @@ class EpisodeIR:
     frame: Mapping[str, Any] = field(default_factory=dict)
     #: The shape of the story (canon.arcs.ARC_TYPES). The director and the panel jobs follow it.
     arc_type: str = ""
+    #: Opt-in series cast binding: display names -> exact kit slugs (never raw role keys).
+    cast_binding: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         scene = {
@@ -153,6 +155,7 @@ class EpisodeIR:
             "cliffhanger": self.cliffhanger,
             "frame": dict(self.frame),
             **({"arc_type": self.arc_type} if self.arc_type else {}),
+            **({"cast_binding": dict(self.cast_binding)} if self.cast_binding else {}),
             "panels": [panel.as_dict() for panel in self.panels],
             "scenes": [scene],
         }
@@ -292,7 +295,7 @@ class LLMDialogueWriter:
         "\"lines\": [{\"speaker\": \"...\", \"text\": \"...\"}]}]} with one entry per panel, same keys. "
         "Rules: dialogue carries the scene - at most 2 lines per panel, each under 90 characters, "
         "in the speaker's voice, only from that panel's speakers; give EVERY main character a "
-        "voice across the stretch (Kensei is the AI agent and should speak, not only be described). "
+        "voice across the stretch (every AI agent in the cast should speak, not only be described). "
         "A caption is optional narration, at most 15 words: the stakes, the tension, what a moment "
         "meant, or a fact nobody would say aloud. It may interpret and it may feel, but it may not "
         "add an event, a result, a cause, a number, a name or a time that the facts do not give. "
@@ -409,7 +412,7 @@ class LLMDialogueWriter:
                     },
                     stage="episode.dialogue",
                 )
-                caption, lines = self._validate(response)
+                caption, lines = self._validate(response, allowed=panel.get("actors") or self.cast)
             except (LLMError, ValueError):
                 self.failures += 1
                 caption, lines = "", []
@@ -834,14 +837,17 @@ def _ending_supported(
     return False, "no panel states it"
 
 
-def _supporting_fact_ids(caption: str, facts: Sequence[Any]) -> tuple[str, ...]:
+def _supporting_fact_ids(
+    caption: str, facts: Sequence[Any], *, cast_stop: Iterable[str] | None = None
+) -> tuple[str, ...]:
     """Event ids of thread facts that share content with the caption (r10b trace).
 
     A caption is judged against its panel's evidence *and* the thread's fact list, so a
     caption can be true because of a fact from another event. Those events are cited
     too, or the trace would point only at the panel and miss the real support.
     """
-    stop = {"the", "and", "with", "that", "this", "from", "into", "wants", "sahil", "kensei"}
+    extra_stop = {str(w).lower() for w in cast_stop} if cast_stop is not None else {"sahil", "kensei"}
+    stop = {"the", "and", "with", "that", "this", "from", "into", "wants"} | extra_stop
 
     def words(text: str) -> set[str]:
         return {w[:6] for w in re.findall(r"[a-z0-9]{4,}", (text or "").lower()) if w not in stop}
@@ -856,7 +862,9 @@ def _supporting_fact_ids(caption: str, facts: Sequence[Any]) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _supporting_event_ids(caption: str, pool: Mapping[str, str]) -> tuple[str, ...]:
+def _supporting_event_ids(
+    caption: str, pool: Mapping[str, str], *, cast_stop: Iterable[str] | None = None
+) -> tuple[str, ...]:
     """Episode events whose own text directly states what the caption says (r10c).
 
     QAR10-03: "not a single file was modified" cited two read-only instructions while
@@ -864,7 +872,8 @@ def _supporting_event_ids(caption: str, pool: Mapping[str, str]) -> tuple[str, .
     event already cited in this episode whose text shares most of the caption's content
     is cited as well.
     """
-    stop = {"the", "and", "with", "that", "this", "from", "into", "wants", "sahil", "kensei"}
+    extra_stop = {str(w).lower() for w in cast_stop} if cast_stop is not None else {"sahil", "kensei"}
+    stop = {"the", "and", "with", "that", "this", "from", "into", "wants"} | extra_stop
 
     def words(text: str) -> set[str]:
         return {
@@ -907,15 +916,20 @@ def _verbatim_support(caption: str, pool: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def caption_citation(
-    caption: str, own_ids: Sequence[str], pool: Mapping[str, str], facts: Sequence[Any]
+    caption: str,
+    own_ids: Sequence[str],
+    pool: Mapping[str, str],
+    facts: Sequence[Any],
+    *,
+    cast_stop: Iterable[str] | None = None,
 ) -> tuple[str, ...]:
     """A caption's cited events, in citing order (shared by the planner and the replay)."""
     return tuple(
         dict.fromkeys(
             _verbatim_support(caption, pool)
             + tuple(own_ids)
-            + _supporting_fact_ids(caption, facts)
-            + _supporting_event_ids(caption, pool)
+            + _supporting_fact_ids(caption, facts, cast_stop=cast_stop)
+            + _supporting_event_ids(caption, pool, cast_stop=cast_stop)
         )
     )
 
@@ -1239,6 +1253,11 @@ def plan_episode(
         _beat = _spec.get("beat")
         for _event_id in (tuple(_beat.event_ids) if _beat else ()):
             episode_pool[_event_id] = str(evidence_map.get(_event_id, ""))
+    cast_stop_words = {
+        word
+        for name in tuple((cast_map or {}).values()) + tuple(cast) + (hero,)
+        for word in re.findall(r"[a-z0-9]+", str(name).lower())
+    }
 
     for index, spec in enumerate(panel_specs, start=1):
         beat: Beat | None = spec["beat"]
@@ -1437,7 +1456,9 @@ def plan_episode(
                 lines=tuple(lines),
                 event_ids=event_ids,
                 caption_source_event_ids=(
-                    caption_citation(caption, event_ids, episode_pool, facts) if caption else ()
+                    caption_citation(caption, event_ids, episode_pool, facts, cast_stop=cast_stop_words)
+                    if caption
+                    else ()
                 ),
             )
         )

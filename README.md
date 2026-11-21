@@ -169,6 +169,9 @@ your live sessions.
   checksum-verified, and skips anything documentation-only or awaiting its creator's approval.
 - Public mode refuses any real person without a consent record. Photo likeness is allowed only
   for yourself.
+- Opt-in **series cast binding** (`--cast-config FILE`, optional `--assets-dir DIR`) locks owner
+  and harness/profile roles to exact character kits across episodes while keeping raw role keys
+  out of shareable episode files. See [`docs/SERIES-CASTING.md`](docs/SERIES-CASTING.md).
 
 ## Privacy
 

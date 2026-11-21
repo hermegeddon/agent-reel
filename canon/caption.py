@@ -112,7 +112,7 @@ def _actor_for(
     message is the profile's character - never a tool name and never "Assistant".
     """
     table = display or {}
-    if _role_of(event) == "user" or event.actor == OWNER_ACTOR:
+    if _role_of(event) == "user" or event.actor == OWNER_ACTOR or (hero and event.actor == hero):
         return table.get(OWNER_ACTOR) or hero
     for key in (event.profile, event.actor):
         if not key:
