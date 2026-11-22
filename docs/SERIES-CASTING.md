@@ -11,11 +11,15 @@ hermes reel kit add maren-lead \
   --name Maren \
   --style anime \
   --sheet /path/to/maren-anime.png \
+  --description "Compact signal cartographer in a cropped deep petrol-teal high-collar jacket with an angled matte-charcoal map tube on a signal-vermilion cross-body strap." \
+  --licence "Original fictional character sheet" \
   --assets-dir /path/to/assets
 
 hermes reel kit approve maren-lead --style anime --yes --assets-dir /path/to/assets
 hermes reel kit approve kensei --style anime --yes --assets-dir /path/to/assets
 ```
+
+*(Note: `hermes reel kit add` records `role: "cast"` in `kit.json` and writes no kit `voice`; `cast.json`'s `"owner"` entry is what casts Maren as narrative lead (`"lead": true`) and supplies her dialogue `"voice"`.)*
 
 2. Create a working two-character `cast.json` (`schema_version: 1`) mapping `owner` and `hermes:default`. Only list roles whose non-draft kits already exist on disk (you can add more co-stars later once their kits are ready):
 
@@ -68,13 +72,13 @@ hermes reel render --plan-dir /path/to/plan-out --episode 1 --style anime --asse
 Once you prepare a kit for another role (for example `harness:claude-code`), you can **add** that new role entry directly to your existing `cast.json` under the same `series_id`:
 
 - Keeping all previously recorded character bindings unchanged and adding new co-stars is allowed seamlessly in `series-<series_id>.json`, and model outputs run under a fresh `cache/cast-<series_id>-<cast_digest>/` directory.
-- Follow-on runs in the same `--data-dir` advance monotonically to the next episode number (`script-ir-2.json`, `episode-2-*`, rendered via `--episode 2`) rather than overwriting earlier episodes, so Chapter 1 (`script-ir-1.json`, rendered via `--episode 1`) stays intact with its original `cast_binding`.
-- Recasting an existing character (`name`, `kit`, or lead assignment) or removing an already-recorded role from the series ledger still fails preflight cleanly; start a new `series_id` or a fresh `--data-dir` when recasting existing characters.
+- Follow-on runs in the same `--data-dir` allocate episode numbers strictly past both `series.next_number` and every existing `script-ir-<N>.json` file on disk (`script-ir-2.json`, `episode-2-*`, rendered via `--episode 2`), even if an explicit episode number is repeated, so Chapter 1 (`script-ir-1.json`, rendered via `--episode 1`) stays intact with its original `cast_binding`.
+- Recasting an existing character (`name`, `kit`, or lead assignment), removing an already-recorded role, or changing `series_id` inside the same `--data-dir` fails preflight cleanly before any LLM call; always use a **fresh `--data-dir`** (together with a new `series_id`) when recasting or starting another series.
 
 ## Participation, validation timing, and privacy
 
-- **Preflight (`0` LLM calls):** Malformed `cast.json`, duplicate/unsafe display names, missing or draft kits referenced in `cast.json`, and incompatible recasts/removals in `series-<series_id>.json` fail immediately with exit code `2`.
-- **Unmapped roles elsewhere or unused in the same thread do not block:** When `--all-profiles` or `kanban.db` encounters unmapped bystander roles—even in the same thread as an eligible story—incidental courtesy replies/acknowledgements (such as `"Thanks for the update."`) and unmapped events whose contributions are not relied on by the episode are isolated at the gate (`unmapped-role-<sha256[:8]>`), excluded from episode briefs/facts/beats and LLM payloads, and do not block planning.
+- **Preflight (`0` LLM calls):** Malformed `cast.json`, duplicate/unsafe display names, missing or draft kits referenced in `cast.json`, directory collisions with another series' ledger or episode files, and incompatible recasts/removals in `series-<series_id>.json` fail immediately with exit code `2`.
+- **Unmapped roles elsewhere or unused in the same thread do not block:** When `--all-profiles` or `kanban.db` encounters unmapped bystander roles—even in the same thread as an eligible story—incidental courtesy replies/acknowledgements (including emoji variants such as `"Thanks for keeping me posted."` or `"Thanks for the update! ❤️"`) and non-material post-completion comments do not overwrite a task's recorded result (`tasks.result` / `completed`) or enter story turns unless a later comment materially changes or qualifies the outcome (such as a hold, blocker, regression, or release condition). Non-relied-on unmapped events are isolated at the gate (`unmapped-role-<sha256[:8]>`), excluded from episode briefs/facts/beats and LLM payloads, and do not block planning.
 - **Relied-on unmapped participants skip only that episode before writing (without crowding out eligible stories):** Before any writing-model call (`write_title`, `write_synopsis`, `plan_episode`), the pipeline determines which events the episode's brief (`goal`, `outcome`, `turns`), panel beats, and atomic facts rely on. If any relied-on event belongs to an unmapped role, only that episode is skipped (never silently recast), planning continues walking the full ranked candidate list until `--episodes` eligible episodes are planned or candidates are exhausted, `metrics.json` records an opaque `unmapped-role-...` skip reason, and `hermes reel plan` prints the actionable missing role key locally.
 - **Shareable `cast_binding` & consent separation:** Episode IR files (`script-ir-*.json`) and render outputs (`render-manifest.json`, `sidecar.json`) store `cast_binding` with display names, exact `kit` slugs, and `"lead": true|false` (narrative framing only)—never raw `hermes:<profile>` or `harness:<name>` role keys. Narrative `"lead": true` never grants permission to depict a real person; likeness and public-render consent always come strictly from the bound kit's own `real_person`, `owner`, and `public_consent` flags plus approved sheet digests in `approvals.json`.
 

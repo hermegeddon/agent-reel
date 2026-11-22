@@ -9,6 +9,7 @@ from canon.brief import (
     event_text,
     is_incidental_acknowledgement,
     is_story_event,
+    materially_changes_outcome,
 )
 from canon.events import (
     KIND_MESSAGE_ASSISTANT,
@@ -145,6 +146,8 @@ def test_incidental_acknowledgement_classifier():
     for text in (
         "ack",
         "Thanks for the update.",
+        "Thanks for the update! ❤️",
+        "Thanks for keeping me posted.",
         "Got it, thanks!",
         "Got it, thanks for the update!",
         "Following along here.",
@@ -163,7 +166,7 @@ def test_incidental_acknowledgement_classifier():
 
 
 def test_incidental_task_comment_after_completion_does_not_become_outcome_or_turn():
-    rows = [
+    base_rows = [
         seal(
             build_event(
                 source="kanban", kind=KIND_TASK_CREATED, ts=1.0, profile="default", actor="owner",
@@ -188,17 +191,38 @@ def test_incidental_task_comment_after_completion_does_not_become_outcome_or_tur
             ),
             {"task_id": "t2", "text": "Fixed the queue lock cleanly."},
         ),
-        seal(
+    ]
+    for trailing in (
+        "Thanks for the update.",
+        "Thanks for keeping me posted.",
+        "Thanks for the update! ❤️",
+        "Enjoy the rest of your evening!",
+    ):
+        assert not materially_changes_outcome(trailing), trailing
+        comment = seal(
             build_event(
                 source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile="default", actor="bystander",
-                subject="t2", payload={"task_id": "t2", "text": "Thanks for the update."},
+                subject="t2", payload={"task_id": "t2", "text": trailing},
                 store="kanban", table="task_comments", pk="t2-k2",
             ),
-            {"task_id": "t2", "text": "Thanks for the update."},
+            {"task_id": "t2", "text": trailing},
+        )
+        brief = build_brief("t2", "task", base_rows + [comment])
+        assert brief.outcome == "Fixed the queue lock cleanly."
+        assert brief.outcome_event_id == base_rows[2].id
+        assert all(turn.event_id != comment.id for turn in brief.turns)
+
+    blocker = "Hold release until retry check finishes."
+    assert materially_changes_outcome(blocker)
+    blocker_ev = seal(
+        build_event(
+            source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile="default", actor="reviewer",
+            subject="t2", payload={"task_id": "t2", "text": blocker},
+            store="kanban", table="task_comments", pk="t2-k3",
         ),
-    ]
-    assert not is_story_event(rows[-1])
-    brief = build_brief("t2", "task", rows)
-    assert brief.outcome == "Fixed the queue lock cleanly."
-    assert brief.outcome_event_id == rows[2].id
-    assert all("Thanks for the update" not in turn.text for turn in brief.turns)
+        {"task_id": "t2", "text": blocker},
+    )
+    blocked_brief = build_brief("t2", "task", base_rows + [blocker_ev])
+    assert blocked_brief.outcome == blocker
+    assert blocked_brief.outcome_event_id == blocker_ev.id
+    assert any(turn.event_id == blocker_ev.id for turn in blocked_brief.turns)

@@ -16,6 +16,7 @@ then checked against brief *plus* the cited events.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -61,6 +62,7 @@ _ACK_GREETING = r"(?:(?:hi|hey|hello)(?:[,!.\s]+(?:team|all|folks|there|everyone
 _ACK_PHRASE = (
     r"(?:ack|acknowledged|received|go received|copy(?: that)?|roger(?: that)?|"
     r"understood|noted|got it|makes sense|sounds good|looks good|lgtm|\+1|"
+    r"good to know|good to hear|glad to hear(?: (?:it|that))?|great news|awesome news|"
     r"will do|all good|no worries|no problem|np|cheers|"
     r"(?:many )?(?:thanks|thank you|thx|ty)|(?:much )?appreciated|"
     r"(?:i )?appreciate (?:it|that|the update|the note|the heads[- ]up|the info|this)|"
@@ -68,21 +70,55 @@ _ACK_PHRASE = (
 )
 _ACK_TAIL = (
     r"(?:[,!\s]+(?:all|team|folks|everyone|here|again|so much|very much|a lot))?"
-    r"(?:\s+for (?:the )?(?:update|updates|heads[- ]up|note|notes|info|information|"
-    r"ping|status|context|summary|sharing|checking|letting me know|looking into (?:it|this)))?"
+    r"(?:\s+for (?:"
+    r"(?:the )?(?:update|updates|heads[- ]up|follow[- ]?up|note|notes|info|information|"
+    r"ping|status|context|summary|sharing|checking|letting me know|looking into (?:it|this))|"
+    r"keeping (?:me|us) (?:posted|updated|in the loop)"
+    r"))?"
 )
 _INCIDENTAL_ACK = re.compile(
     rf"^\s*{_ACK_GREETING}{_ACK_PHRASE}{_ACK_TAIL}(?:[,;\s\-\u2014]+{_ACK_PHRASE}{_ACK_TAIL})?[.!\s]*$",
     re.IGNORECASE,
 )
 
+#: Signals that a post-completion comment alters or qualifies the recorded task result.
+_MATERIAL_OUTCOME = re.compile(
+    r"\b("
+    r"hold|wait|pause|stop|block(?:ed|ing)?|reopen(?:ed|ing)?|revert(?:ed|ing)?|"
+    r"roll\s*back|reject(?:ed|ing)?|fail(?:ed|s|ing|ure)?|broke(?:n)?|bug|regression|"
+    r"error|exception|traceback|crash(?:ed|es)?|time(?:d)?\s*out|retry|flaky|stuck|"
+    r"missing|wrong|mismatch|denied|refused|"
+    r"still\s+(?:see(?:s|ing)?|broken|failing|out|down|happening|repro\w*)|"
+    r"not\s+(?:fixed|resolved|done|working|ready|merged|deployed)|"
+    r"until|before\s+(?:release|deploy|merge|shipping)|"
+    r"must|needs?\s+to|requires?|require|sign[- ]?off|approv(?:e|ed|al)|decide|decision|go/no-go|"
+    r"do\s+not|don'?t\s+(?:merge|deploy|release|ship)|"
+    r"reproduced|verified|confirmed|superseded|replaced|amended|deployed|shipped|merged|passed|resolved"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_decorative_symbols(text: str) -> str:
+    return "".join(
+        ch for ch in str(text or "") if unicodedata.category(ch) not in {"So", "Sk", "Mn", "Cf"}
+    )
+
 
 def is_incidental_acknowledgement(text: str) -> bool:
     """True for brief courtesy replies, receipts, or watch-list notes without story substance."""
-    clean = " ".join(str(text or "").split())
+    clean = " ".join(_strip_decorative_symbols(text).split())
     if not clean or len(clean) > 100:
         return False
     return bool(_INCIDENTAL_ACK.match(clean))
+
+
+def materially_changes_outcome(text: str) -> bool:
+    """True when a task comment introduces a substantive hold, blocker, decision, or changed outcome."""
+    clean = " ".join(str(text or "").split())
+    if not clean or is_incidental_acknowledgement(clean):
+        return False
+    return bool(_MATERIAL_OUTCOME.search(clean))
 
 
 def looks_like_tool_payload(text: str) -> bool:
@@ -332,6 +368,7 @@ def build_brief(
     goal_event_id = ""
     outcome = ""
     outcome_event_id = ""
+    turn_rows: Sequence[GatedEvent] = rows
     if kind == "session":
         user_row = next(
             (
@@ -372,21 +409,58 @@ def build_brief(
         if goal_row is not None:
             goal = event_text(goal_row)
             goal_event_id = goal_row.id
-        finished_row = next(
+        recorded_finish = next(
             (
                 row
                 for row in reversed(rows)
-                if (is_story_event(row) and row.kind == KIND_TASK_FINISHED)
-                or (row.kind == KIND_TASK_STATUS and str((row.payload or {}).get("kind")) == "completed")
-                or (row.kind == KIND_TASK_COMMENT and is_story_event(row) and event_text(row))
+                if (
+                    (is_story_event(row) and row.kind == KIND_TASK_FINISHED)
+                    or (row.kind == KIND_TASK_STATUS and str((row.payload or {}).get("kind")) == "completed")
+                )
+                and event_text(row)
             ),
             None,
         )
+        if recorded_finish is not None:
+            material_later = next(
+                (
+                    row
+                    for row in reversed(rows)
+                    if row.ts >= recorded_finish.ts
+                    and row.id != recorded_finish.id
+                    and row.kind == KIND_TASK_COMMENT
+                    and is_story_event(row)
+                    and materially_changes_outcome(event_text(row))
+                ),
+                None,
+            )
+            finished_row = material_later or recorded_finish
+            # Ignore non-material post-completion chatter when picking brief turns too.
+            turn_rows = [
+                row
+                for row in rows
+                if not (
+                    row.kind == KIND_TASK_COMMENT
+                    and row.ts >= recorded_finish.ts
+                    and not materially_changes_outcome(event_text(row))
+                )
+            ]
+        else:
+            finished_row = next(
+                (
+                    row
+                    for row in reversed(rows)
+                    if (is_story_event(row) and row.kind == KIND_TASK_FINISHED)
+                    or (row.kind == KIND_TASK_STATUS and str((row.payload or {}).get("kind")) == "completed")
+                    or (row.kind == KIND_TASK_COMMENT and is_story_event(row) and event_text(row))
+                ),
+                None,
+            )
         if finished_row is not None:
             outcome = event_text(finished_row)
             outcome_event_id = finished_row.id
 
-    turns = _key_turns(rows, limit=max_turns)
+    turns = _key_turns(turn_rows, limit=max_turns)
 
     brief = ThreadBrief(
         thread_key=thread_key,

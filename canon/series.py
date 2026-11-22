@@ -227,7 +227,7 @@ def verify_series_compatibility(
     if not series.cast_digest and series.chapters:
         raise CastConfigError(
             f"series ledger already holds {len(series.chapters)} uncasted chapter(s); "
-            "use a new series_id or new --data-dir"
+            "use a fresh --data-dir (and new series_id)"
         )
     if not series.cast_digest or series.cast_digest == cast_digest:
         return
@@ -237,19 +237,19 @@ def verify_series_compatibility(
             if cur is None:
                 raise CastConfigError(
                     f"existing role binding ({prev.get('name', slot)!r}) was removed for series {series_id!r}; "
-                    "use a new series_id or new --data-dir instead of dropping existing cast members"
+                    "use a fresh --data-dir (and new series_id) instead of dropping existing cast members"
                 )
             prev_sig = (prev.get("name"), prev.get("kit"), prev.get("lead"))
             cur_sig = (cur.get("name"), cur.get("kit"), cur.get("lead"))
             if cur_sig != prev_sig:
                 raise CastConfigError(
                     f"cast binding changed for series {series_id!r} ({prev_sig!r} -> {cur_sig!r}); "
-                    "use a new series_id or new --data-dir instead of silently recasting existing chapters"
+                    "use a fresh --data-dir (and new series_id) instead of silently recasting existing chapters"
                 )
         return
     raise CastConfigError(
         f"cast revision changed for series {series_id!r} ({series.cast_digest} -> {cast_digest}); "
-        "use a new series_id or new --data-dir instead of silently recasting existing chapters"
+        "use a fresh --data-dir (and new series_id) instead of silently recasting existing chapters"
     )
 
 

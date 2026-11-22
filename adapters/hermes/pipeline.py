@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -61,6 +62,7 @@ from canon.llm import CachedLLM, LLMClient, NullLLM
 from canon.panel_prompt import episode_cast
 from canon.redact import DeterministicRedactor, ModelEntityGate, RedactionGate
 from canon.series import (
+    SERIES_FILE,
     load as load_series,
     order_for_series,
     save as save_series,
@@ -486,6 +488,68 @@ def _trim_arc(arc: Any, panels: int) -> Any:
     return replace(arc, roles=trimmed)
 
 
+_SCRIPT_IR_NUM_RE = re.compile(r"^script-ir-(\d+)\.json$")
+
+
+def _existing_episode_numbers(data_dir: Path) -> set[int]:
+    if not data_dir.is_dir():
+        return set()
+    numbers: set[int] = set()
+    for path in data_dir.iterdir():
+        match = _SCRIPT_IR_NUM_RE.fullmatch(path.name)
+        if match and path.is_file():
+            numbers.add(int(match.group(1)))
+    return numbers
+
+
+def _verify_cast_directory_isolation(data_dir: Path, series_id: str) -> None:
+    """Refuse mixing distinct series or uncasted chapters in the same ``--data-dir``."""
+    if not data_dir.is_dir():
+        return
+    legacy_ledger = data_dir / SERIES_FILE
+    if legacy_ledger.is_file():
+        legacy = load_series(legacy_ledger)
+        if legacy.chapters:
+            raise CastConfigError(
+                f"directory {data_dir} already holds uncasted series ledger {SERIES_FILE}; "
+                f"use a fresh --data-dir for series {series_id!r}"
+            )
+    own_name = f"series-{series_id}.json"
+    has_episodes = bool(_existing_episode_numbers(data_dir))
+    for ledger_path in sorted(data_dir.glob("series-*.json")):
+        if ledger_path.name == own_name:
+            continue
+        other = load_series(ledger_path)
+        other_id = other.series_id or ledger_path.stem.removeprefix("series-")
+        if other.chapters or other.series_id or has_episodes:
+            raise CastConfigError(
+                f"directory {data_dir} already belongs to series {other_id!r}; "
+                f"use a fresh --data-dir for series {series_id!r} so existing episodes are preserved"
+            )
+    for path in sorted(data_dir.iterdir()):
+        match = _SCRIPT_IR_NUM_RE.fullmatch(path.name)
+        if not match or not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CastConfigError(
+                f"existing episode file {path.name} in {data_dir} cannot be verified; use a fresh --data-dir"
+            ) from exc
+        binding = raw.get("cast_binding") if isinstance(raw, Mapping) else None
+        if not isinstance(binding, Mapping):
+            raise CastConfigError(
+                f"directory {data_dir} already holds uncasted episode {path.name}; "
+                f"use a fresh --data-dir for series {series_id!r}"
+            )
+        found_id = str(binding.get("series_id") or "")
+        if found_id != series_id:
+            raise CastConfigError(
+                f"directory {data_dir} already holds {path.name} for series {found_id!r}; "
+                f"use a fresh --data-dir for series {series_id!r}"
+            )
+
+
 def validate_cast_setup(
     cast_config: SeriesCastConfig | Path | str | None,
     *,
@@ -516,6 +580,7 @@ def validate_cast_setup(
     for name in cast_cfg.all_display_names():
         if redactor.findings(name):
             raise CastConfigError(f"configured character name {name!r} triggers redaction rules")
+    _verify_cast_directory_isolation(data_dir, cast_cfg.series_id)
     series_path = series_file_for(data_dir, cast_cfg.series_id)
     verify_series_compatibility(
         load_series(series_path),
@@ -1056,6 +1121,12 @@ def run_pipeline(
 
         series_path = series_file_for(config.data_dir, cast_cfg.series_id if cast_cfg is not None else "")
         series = load_series(series_path)
+        existing_ep_nums = (
+            _existing_episode_numbers(config.data_dir)
+            if (cast_cfg is not None or bool(series.chapters))
+            else set()
+        )
+        allocated_ep_nums: set[int] = set(existing_ep_nums)
         selected, series_skipped = order_for_series(selected, series)
         skipped.extend(series_skipped)
         for candidate in selected:
@@ -1246,7 +1317,8 @@ def run_pipeline(
             # Advance saved episode numbers monotonically with the series ledger so
             # follow-on runs (including adding co-stars) never overwrite prior plans.
             chapter_number = series.next_number
-            episode_number = max(config.number + index - 1, chapter_number)
+            min_free = max([chapter_number, *(num + 1 for num in allocated_ep_nums)])
+            episode_number = max(config.number + index - 1, min_free)
             frame = draw_frame(effective_hero, chapter_number, avoid=series.avoid())
 
             def _plan(episode_writer: Any, layer: str = "caption") -> EpisodeIR:
@@ -1405,6 +1477,7 @@ def run_pipeline(
                     "story": story_info,
                 }
             )
+            allocated_ep_nums.add(episode_number)
             used_anchors |= anchor_events
             used_arcs.add(arc.id)
             # M3: remember the chapter so the next run follows on and never retells it.
@@ -1522,8 +1595,13 @@ def run_pipeline(
                 write_json(config.data_dir / "script-ir.json", ir.as_dict(), gate)
             for row in episodes:
                 episode_ir = row["ir"]
+                ir_out = config.data_dir / f"script-ir-{row['number']}.json"
+                if (cast_cfg is not None or existing_ep_nums) and ir_out.exists():
+                    raise CastConfigError(
+                        f"refusing to overwrite existing planned episode {ir_out.name} in {config.data_dir}"
+                    )
                 write_json(
-                    config.data_dir / f"script-ir-{row['number']}.json",
+                    ir_out,
                     episode_ir.as_dict(),
                     gate,
                 )
