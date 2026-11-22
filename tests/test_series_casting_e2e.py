@@ -1107,3 +1107,133 @@ def test_later_mapped_meeting_notes_leaves_unmapped_frozen_queue_unresolved_e2e(
     for path in sorted(plan_ok.rglob("*")):
         if path.is_file():
             assert reviewer not in path.read_text(encoding="utf-8", errors="ignore"), path
+
+
+def test_clean_task_meeting_notes_from_mapped_and_unmapped_both_produce_episode_e2e(
+    tmp_path, monkeypatch, capsys
+):
+    assets = tmp_path / "assets"
+    _make_kit(assets, "maren-lead", "Maren", role="hero")
+    unmapped_author = "secret-notetaker"
+    note_text = "Added the queue lock summary to Friday's meeting notes."
+
+    for label, author in (("mapped", "default"), ("unmapped", unmapped_author)):
+        home = tmp_path / f"home_{label}"
+        _seed_finished_kanban_home(
+            home,
+            task_id=f"t-notes-{label}",
+            result_text="Fixed the queue lock cleanly.",
+            reviewer_profile=author,
+            trailing_comment=note_text,
+        )
+        cast_cfg = tmp_path / f"cast_{label}.json"
+        cast_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "series_id": f"clean-notes-{label}",
+                    "assets_dir": str(assets),
+                    "owner": {"name": "Maren", "kit": "maren-lead"},
+                    "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan_dir = tmp_path / f"plan_{label}"
+        harness = _FakeE2EHarness()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("REEL_ALLOW_CUSTOM_STATE", "1")
+        rc = _run_plan_and_render_with_harness(
+            monkeypatch,
+            harness,
+            argv=[
+                "plan", "--dry-run",
+                "--data-dir", str(plan_dir),
+                "--cast-config", str(cast_cfg),
+                "--all-profiles",
+                "--episodes", "1",
+            ],
+            default_dir=tmp_path / f"default_{label}",
+        )
+        out = capsys.readouterr().out
+        assert rc == 0, (label, out)
+        assert harness.llm_calls, label
+        assert "cast diagnostics" not in out, label
+        ir = json.loads((plan_dir / "script-ir-1.json").read_text(encoding="utf-8"))
+        assert ir["cast_binding"]["characters"] == {
+            "Maren": {"kit": "maren-lead", "lead": True},
+            "Kensei": {"kit": "kensei", "lead": False},
+        }
+        assert "Fixed the queue lock cleanly" in json.dumps(harness.llm_calls), label
+        assert "meeting notes" not in json.dumps(harness.llm_calls).lower(), label
+        assert "meeting notes" not in (plan_dir / "episode-1-script.md").read_text(encoding="utf-8").lower(), label
+        for path in sorted(plan_dir.rglob("*")):
+            if path.is_file():
+                assert unmapped_author not in path.read_text(encoding="utf-8", errors="ignore"), path
+
+
+def test_chapter_with_thirteen_required_turns_finishes_planning_e2e(tmp_path, monkeypatch):
+    assets = tmp_path / "assets"
+    _make_kit(assets, "maren-lead", "Maren", role="hero")
+    home = tmp_path / "home_ch13"
+    required_comments = [
+        (
+            "default",
+            f"Verification batch {idx:02d} still flagged queue retry latency before release.",
+            NOW - 3750 + idx * 10.0,
+        )
+        for idx in range(1, 13)
+    ]
+    required_comments.append(
+        ("default", "Approved retry check verification with 18 tests passing cleanly.", NOW - 3600.0)
+    )
+    _seed_finished_kanban_home(
+        home,
+        task_id="t-ch13",
+        result_text="Fixed the queue lock cleanly.",
+        reviewer_profile="default",
+        trailing_comment=required_comments[0][1],
+        follow_up_comments=tuple(required_comments[1:]),
+    )
+    cast_cfg = tmp_path / "cast_ch13.json"
+    cast_cfg.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "chapter-13-req",
+                "assets_dir": str(assets),
+                "owner": {"name": "Maren", "kit": "maren-lead"},
+                "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_dir = tmp_path / "plan_ch13"
+    harness = _FakeE2EHarness()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("REEL_ALLOW_CUSTOM_STATE", "1")
+    rc = _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness,
+        argv=[
+            "plan", "--dry-run",
+            "--format", "chapter",
+            "--data-dir", str(plan_dir),
+            "--cast-config", str(cast_cfg),
+            "--episodes", "1",
+        ],
+        default_dir=tmp_path / "default_ch13",
+    )
+    assert rc == 0
+    assert (plan_dir / "script-ir-1.json").is_file()
+    ir = json.loads((plan_dir / "script-ir-1.json").read_text(encoding="utf-8"))
+    assert ir["format"] == "chapter"
+    assert ir["cast_binding"]["characters"] == {
+        "Maren": {"kit": "maren-lead", "lead": True},
+        "Kensei": {"kit": "kensei", "lead": False},
+    }
+    trace = json.loads((plan_dir / "episode-1-trace.json").read_text(encoding="utf-8"))
+    turn_fact_objects = [f.get("object", "") for f in trace["facts"] if f.get("kind") == "turn"]
+    assert len(turn_fact_objects) >= 13
+    for _, msg, _ in required_comments:
+        assert any(msg[:30] in obj for obj in turn_fact_objects), msg

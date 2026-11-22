@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from canon.brief import (
+    CHAPTER_MAX_TURNS,
     MAX_TURNS,
     MIN_TURNS,
+    _spread,
     build_brief,
     event_text,
     is_incidental_acknowledgement,
@@ -363,3 +365,134 @@ def test_later_meeting_notes_comment_leaves_post_completion_report_unresolved():
     brief_b = build_brief("t3", "task", base_rows + [frozen_ev, retry_notes_ev])
     assert frozen_ev.id in brief_b.post_completion_event_ids
     assert any(turn.event_id == frozen_ev.id for turn in brief_b.turns)
+
+
+def test_chapter_turn_selection_one_slot_remaining_retains_required_turns():
+    ordinary_pairs = [
+        (
+            seal(
+                build_event(
+                    source="kanban", kind=KIND_TASK_COMMENT, ts=float(i + 1), profile="default", actor="Kensei",
+                    subject="t-spread", payload={"task_id": "t-spread", "text": f"Ordinary step {i} completed cleanly."},
+                    store="kanban", table="task_comments", pk=f"sp-{i}",
+                ),
+                {"task_id": "t-spread", "text": f"Ordinary step {i} completed cleanly."},
+            ),
+            f"Ordinary step {i} completed cleanly.",
+        )
+        for i in range(4)
+    ]
+    assert [text for _, text in _spread(ordinary_pairs, 1)] == ["Ordinary step 0 completed cleanly."]
+    assert _spread(ordinary_pairs, 0) == []
+
+    rows = [
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_CREATED, ts=1.0, profile="default", actor="owner",
+                subject="t-ch", payload={"task_id": "t-ch", "title": "Harden chapter lock handling"},
+                store="kanban", table="tasks", pk="ch-c",
+            ),
+            {"task_id": "t-ch", "title": "Harden chapter lock handling"},
+        ),
+    ]
+    ordinary_texts = [
+        "Audited initial lock timeout configuration.",
+        "Traced stale queue bypass under load.",
+        "Patched worker retry backoff limit.",
+        "Confirmed staging queue stayed balanced.",
+    ]
+    for idx, msg in enumerate(ordinary_texts, start=2):
+        rows.append(
+            seal(
+                build_event(
+                    source="kanban", kind=KIND_TASK_COMMENT, ts=float(idx), profile="default", actor="Kensei",
+                    subject="t-ch", payload={"task_id": "t-ch", "text": msg},
+                    store="kanban", table="task_comments", pk=f"ch-ord-{idx}",
+                ),
+                {"task_id": "t-ch", "text": msg},
+            )
+        )
+    rows.append(
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_FINISHED, ts=6.0, profile="default", actor="Kensei",
+                subject="t-ch", payload={"task_id": "t-ch", "text": "Fixed the queue lock cleanly."},
+                store="kanban", table="tasks", pk="ch-fin",
+            ),
+            {"task_id": "t-ch", "text": "Fixed the queue lock cleanly."},
+        )
+    )
+    required_evs = []
+    for idx in range(1, 14):
+        msg = f"Follow-up verification #{idx:02d}: retry check reported pending detail."
+        ev = seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=float(6 + idx), profile="default", actor="Kensei",
+                subject="t-ch", payload={"task_id": "t-ch", "text": msg},
+                store="kanban", table="task_comments", pk=f"ch-req-{idx}",
+            ),
+            {"task_id": "t-ch", "text": msg},
+        )
+        required_evs.append(ev)
+        rows.append(ev)
+
+    brief = build_brief("t-ch", "task", rows, max_turns=CHAPTER_MAX_TURNS)
+    assert len(brief.post_completion_event_ids) == 13
+    assert len(brief.turns) == CHAPTER_MAX_TURNS == 14
+    selected_ids = {turn.event_id for turn in brief.turns}
+    assert {ev.id for ev in required_evs} <= selected_ids
+    assert len(selected_ids - {ev.id for ev in required_evs}) == 1
+
+
+def test_clean_task_meeting_notes_non_material_for_mapped_and_unmapped():
+    for note in (
+        "Added the queue lock summary to Friday's meeting notes.",
+        "Filed meeting notes for the queue lock rollout.",
+        "The meeting notes were updated.",
+    ):
+        assert not materially_changes_outcome(note), note
+
+    assert materially_changes_outcome("Added a new bug to Friday's meeting notes.")
+    assert materially_changes_outcome("Noted blank pages on checkout in meeting notes.")
+
+    base_rows = [
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_CREATED, ts=1.0, profile="default", actor="owner",
+                subject="t4", payload={"task_id": "t4", "title": "Fix queue lock guard cleanly"},
+                store="kanban", table="tasks", pk="t4-c",
+            ),
+            {"task_id": "t4", "title": "Fix queue lock guard cleanly"},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=2.0, profile="default", actor="Kensei",
+                subject="t4", payload={"task_id": "t4", "text": "Audited lock timeout across worker pool."},
+                store="kanban", table="task_comments", pk="t4-k1",
+            ),
+            {"task_id": "t4", "text": "Audited lock timeout across worker pool."},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_FINISHED, ts=3.0, profile="default", actor="Kensei",
+                subject="t4", payload={"task_id": "t4", "text": "Fixed the queue lock cleanly."},
+                store="kanban", table="tasks", pk="t4-f",
+            ),
+            {"task_id": "t4", "text": "Fixed the queue lock cleanly."},
+        ),
+    ]
+    note_text = "Added the queue lock summary to Friday's meeting notes."
+    for author in ("Kensei", "unmapped-role-deadbeef"):
+        note_ev = seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile=author, actor=author,
+                subject="t4", payload={"task_id": "t4", "text": note_text},
+                store="kanban", table="task_comments", pk=f"t4-note-{author}",
+            ),
+            {"task_id": "t4", "text": note_text},
+        )
+        brief = build_brief("t4", "task", base_rows + [note_ev])
+        assert brief.outcome == "Fixed the queue lock cleanly."
+        assert brief.outcome_event_id == base_rows[2].id
+        assert brief.post_completion_event_ids == ()
+        assert all(turn.event_id != note_ev.id for turn in brief.turns)

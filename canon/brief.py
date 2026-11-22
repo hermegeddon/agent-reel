@@ -203,11 +203,12 @@ def is_non_factual_chatter(text: str) -> bool:
 
 
 def materially_changes_outcome(text: str) -> bool:
-    """Fail-closed check: True whenever a post-completion comment is not ignorable chatter."""
+    """Fail-closed check: True unless a post-completion comment is ignorable social chatter
+    or a non-contradictory bookkeeping follow-up (e.g. filing meeting notes)."""
     clean = _normalize_comment(text)
     if not clean:
         return False
-    return not is_non_factual_chatter(clean)
+    return not is_non_factual_chatter(clean) and not _is_admin_followup(clean)
 
 
 def _has_contradiction_signal(text: str) -> bool:
@@ -219,15 +220,20 @@ def _has_contradiction_signal(text: str) -> bool:
 _ADMIN_FOLLOWUP = re.compile(
     r"^\s*(?:"
     r"(?:i\s+|we\s+)?"
-    r"(?:added|logged|noted|recorded|posted|shared|copied|filed|linked|updated|archived|put)\b"
+    r"(?:added|logged|noted|recorded|posted|shared|copied|filed|linked|updated|archived|put|saved|wrote|captured|summari[sz]ed)\b"
     r".{0,100}\b"
     r"(?:meeting\s+notes?|stand[- ]?up(?:\s+notes?)?|notes?|changelog|release\s+notes?|"
     r"runbook|wiki|docs?|documentation|retro(?:spective)?|minutes)\b"
     r"|"
     r"(?:the\s+)?(?:meeting\s+notes?|stand[- ]?up(?:\s+notes?)?|notes?|changelog|"
     r"release\s+notes?|runbook|wiki|docs?|documentation|minutes)\s+"
-    r"(?:were\s+|are\s+|have\s+been\s+)?(?:updated|synced|refreshed|archived|linked)\b"
+    r"(?:were\s+|are\s+|have\s+been\s+)?(?:updated|synced|refreshed|archived|linked|filed|posted|saved|recorded|logged|shared)\b"
     r")[^?!]*[.!\s]*$",
+    re.IGNORECASE,
+)
+
+_ADMIN_DEFECT_GUARD = re.compile(
+    r"\b(?:bug|bugs|issue|issues|problem|problems|symptom|symptoms|defect|defects|blank|empty)\b",
     re.IGNORECASE,
 )
 
@@ -235,7 +241,12 @@ _ADMIN_FOLLOWUP = re.compile(
 def _is_admin_followup(text: str) -> bool:
     """True for non-contradictory post-completion bookkeeping notes (e.g. meeting notes)."""
     clean = _normalize_comment(text)
-    if not clean or len(clean) > MAX_NON_FACTUAL_CHARS or _has_contradiction_signal(clean):
+    if (
+        not clean
+        or len(clean) > MAX_NON_FACTUAL_CHARS
+        or _has_contradiction_signal(clean)
+        or _ADMIN_DEFECT_GUARD.search(clean)
+    ):
         return False
     return bool(_ADMIN_FOLLOWUP.match(clean))
 
@@ -363,6 +374,8 @@ CHAPTER_MAX_TURNS = 14
 
 def _spread(candidates: list[tuple[GatedEvent, str]], limit: int) -> list[tuple[GatedEvent, str]]:
     """Distinct texts sampled evenly from start to end (first and last kept)."""
+    if limit <= 0:
+        return []
     distinct: list[tuple[GatedEvent, str]] = []
     seen: set[str] = set()
     for event, text in candidates:
@@ -371,6 +384,8 @@ def _spread(candidates: list[tuple[GatedEvent, str]], limit: int) -> list[tuple[
             distinct.append((event, text))
     if len(distinct) <= limit:
         return distinct
+    if limit == 1:
+        return [distinct[0]]
     step = (len(distinct) - 1) / (limit - 1)
     picked = sorted({round(i * step) for i in range(limit)})
     return [distinct[i] for i in picked]
@@ -401,13 +416,23 @@ def _key_turns(
         else:
             seen_long: set[str] = set()
             pinned: list[tuple[GatedEvent, str]] = []
-            rest: list[tuple[GatedEvent, str]] = []
             for event, text in ordered:
+                if event.id not in required:
+                    continue
                 lower = text.lower()
                 if lower in seen_long:
                     continue
                 seen_long.add(lower)
-                (pinned if event.id in required else rest).append((event, text))
+                pinned.append((event, text))
+            rest: list[tuple[GatedEvent, str]] = []
+            for event, text in ordered:
+                if event.id in required:
+                    continue
+                lower = text.lower()
+                if lower in seen_long:
+                    continue
+                seen_long.add(lower)
+                rest.append((event, text))
             if len(pinned) >= limit:
                 chosen_long = pinned[-limit:]
             else:
@@ -597,13 +622,10 @@ def build_brief(
             contradictions = [
                 row for row in material_later_rows if _has_contradiction_signal(event_text(row))
             ]
-            non_admin = [
-                row for row in material_later_rows if not _is_admin_followup(event_text(row))
-            ]
             if contradictions:
                 finished_row = contradictions[-1]
-            elif non_admin:
-                finished_row = non_admin[-1]
+            elif material_later_rows:
+                finished_row = material_later_rows[-1]
             else:
                 finished_row = recorded_finish
             # Ignore non-material post-completion chatter when picking brief turns too.
