@@ -78,6 +78,7 @@ class Series:
     chapters: list[dict[str, Any]] = field(default_factory=list)
     series_id: str = ""
     cast_digest: str = ""
+    cast_roles: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # ---- reading -----------------------------------------------------------
     @property
@@ -169,6 +170,10 @@ class Series:
             out["series_id"] = self.series_id
         if self.cast_digest:
             out["cast_digest"] = self.cast_digest
+        if self.cast_roles:
+            out["cast_roles"] = {
+                str(k): dict(v) for k, v in sorted(self.cast_roles.items())
+            }
         return out
 
 
@@ -182,10 +187,21 @@ def load(path: Path) -> Series:
     if not isinstance(raw, Mapping):
         return Series()
     chapters = raw.get("chapters")
+    raw_roles = raw.get("cast_roles")
+    cast_roles = (
+        {
+            str(k): dict(v)
+            for k, v in raw_roles.items()
+            if isinstance(k, str) and isinstance(v, Mapping)
+        }
+        if isinstance(raw_roles, Mapping)
+        else {}
+    )
     return Series(
         [dict(ch) for ch in chapters or [] if isinstance(ch, Mapping)],
         series_id=str(raw.get("series_id", "")),
         cast_digest=str(raw.get("cast_digest", "")),
+        cast_roles=cast_roles,
     )
 
 
@@ -194,24 +210,47 @@ def series_file_for(data_dir: Path, series_id: str = "") -> Path:
     return data_dir / (f"series-{series_id}.json" if series_id else SERIES_FILE)
 
 
-def verify_series_compatibility(series: Series, *, series_id: str, cast_digest: str) -> None:
-    """Reject silent reuse of a ledger whose series or cast revision differs."""
+def verify_series_compatibility(
+    series: Series,
+    *,
+    series_id: str,
+    cast_digest: str,
+    cast_roles: Mapping[str, Mapping[str, Any]] | None = None,
+) -> None:
+    """Reject silent recasting or removal of existing roles; allow adding new co-stars."""
     from canon.series_cast import CastConfigError
 
     if series.series_id and series.series_id != series_id:
         raise CastConfigError(
             f"series ledger belongs to {series.series_id!r}, cannot mix with {series_id!r}"
         )
-    if series.cast_digest and series.cast_digest != cast_digest:
-        raise CastConfigError(
-            f"cast revision changed for series {series_id!r} ({series.cast_digest} -> {cast_digest}); "
-            "use a new series_id or new --data-dir instead of silently recasting existing chapters"
-        )
     if not series.cast_digest and series.chapters:
         raise CastConfigError(
             f"series ledger already holds {len(series.chapters)} uncasted chapter(s); "
             "use a new series_id or new --data-dir"
         )
+    if not series.cast_digest or series.cast_digest == cast_digest:
+        return
+    if series.cast_roles and cast_roles is not None:
+        for slot, prev in series.cast_roles.items():
+            cur = cast_roles.get(slot)
+            if cur is None:
+                raise CastConfigError(
+                    f"existing role binding ({prev.get('name', slot)!r}) was removed for series {series_id!r}; "
+                    "use a new series_id or new --data-dir instead of dropping existing cast members"
+                )
+            prev_sig = (prev.get("name"), prev.get("kit"), prev.get("lead"))
+            cur_sig = (cur.get("name"), cur.get("kit"), cur.get("lead"))
+            if cur_sig != prev_sig:
+                raise CastConfigError(
+                    f"cast binding changed for series {series_id!r} ({prev_sig!r} -> {cur_sig!r}); "
+                    "use a new series_id or new --data-dir instead of silently recasting existing chapters"
+                )
+        return
+    raise CastConfigError(
+        f"cast revision changed for series {series_id!r} ({series.cast_digest} -> {cast_digest}); "
+        "use a new series_id or new --data-dir instead of silently recasting existing chapters"
+    )
 
 
 def save(path: Path, series: Series) -> None:

@@ -370,12 +370,12 @@ def _rule_fillers(treatment: "Treatment", ir: Mapping[str, Any]) -> list[PanelTr
     cast = _episode_cast(ir)
     binding = ir.get("cast_binding")
     chars = binding.get("characters") if isinstance(binding, Mapping) else None
-    owner_candidates = [
+    lead_candidates = [
         name
         for name, entry in (chars.items() if isinstance(chars, Mapping) else ())
-        if isinstance(entry, Mapping) and entry.get("owner") is True and name in cast
+        if isinstance(entry, Mapping) and entry.get("lead") is True and name in cast
     ]
-    hero = owner_candidates[0] if owner_candidates else ("Sahil" if "Sahil" in cast else (cast[0] if cast else ""))
+    hero = lead_candidates[0] if lead_candidates else ("Sahil" if "Sahil" in cast else (cast[0] if cast else ""))
     name = treatment.villain_name
     fillers: list[PanelTreatment] = []
     toggle = 0

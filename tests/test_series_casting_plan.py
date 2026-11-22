@@ -529,8 +529,8 @@ def test_owner_rename_replaces_sahil_and_respects_config_voice(tmp_path, monkeyp
     ir_data = json.loads((data_dir / "script-ir-1.json").read_text(encoding="utf-8"))
     binding = ir_data["cast_binding"]
     assert binding["series_id"] == "pilot-series"
-    assert binding["characters"]["Rowan"] == {"kit": "placeholder-lead", "owner": True}
-    assert "Kensei" in binding["characters"]
+    assert binding["characters"]["Rowan"] == {"kit": "placeholder-lead", "lead": True}
+    assert binding["characters"]["Kensei"] == {"kit": "kensei", "lead": False}
 
 
 def test_hermes_claude_profile_and_harness_claude_code_and_codex_stay_distinct(tmp_path, monkeypatch):
@@ -812,23 +812,36 @@ def test_unmapped_participating_role_stops_episode_before_story_writing(tmp_path
     for rel, text in _all_text_under(data_a).items():
         assert "secret-guest" not in text, f"raw profile leaked into {rel}"
 
-    # Case B: Mapped task (`hermes:default`) has an unmapped kanban commenter -> stopped before writing.
+    # Case B: Mapped task (`hermes:default`) has a relied-on unmapped kanban comment (`outcome`) -> stopped before writing.
     home_b = _setup_hermes_home(tmp_path / "case_b")
     _bind_hermes_env(monkeypatch, home_b)
     kconn = _init_kanban_db(home_b / "kanban.db")
     kconn.execute(
         "INSERT INTO tasks (id, title, body, assignee, status, priority, created_by, created_at, started_at, completed_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("t-collab", "Fix build script", "Task created for queue.", "default", "completed", 1, "owner", NOW - 5000, NOW - 4500, NOW - 4000),
+        ("t-collab", "Fix build script cleanly", "Fix build script cleanly.", "default", "completed", 1, "owner", NOW - 5000, NOW - 4800, NOW - 4000),
     )
-    for idx, kind_val in enumerate(("blocked", "unblocked", "blocked", "completed")):
+    for kind_val, ts_val, note in (
+        ("blocked", NOW - 4700, "step 0"),
+        ("unblocked", NOW - 4640, "step 1"),
+        ("blocked", NOW - 4200, "step 2"),
+        ("completed", NOW - 4100, "step 3"),
+    ):
         kconn.execute(
             "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
-            ("t-collab", kind_val, json.dumps({"note": f"step {idx}"}), NOW - 4400 + idx * 60),
+            ("t-collab", kind_val, json.dumps({"note": note}), ts_val),
         )
     kconn.execute(
         "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
-        ("t-collab", "secret-reviewer", "Hold release until retry check finishes.", NOW - 4200),
+        ("t-collab", "default", "Checked build lock timeout guard.", NOW - 4550),
+    )
+    kconn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+        ("t-collab", "default", "Patched build retry threshold limit.", NOW - 4450),
+    )
+    kconn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+        ("t-collab", "secret-reviewer", "Hold release until retry check finishes.", NOW - 3900),
     )
     kconn.commit()
     kconn.close()
@@ -848,9 +861,120 @@ def test_unmapped_participating_role_stops_episode_before_story_writing(tmp_path
     )
     assert res_b.ir is None
     assert writer_b.calls == []
-    assert any("hermes:secret-reviewer" in diag for diag in res_b.cast_diagnostics)
+    assert any("hermes:secret-reviewer" in diag for diag in res_b.cast_diagnostics), res_b.skipped_stories
+    assert any("unmapped participating role" in row["reason"] for row in res_b.skipped_stories)
     for rel, text in _all_text_under(data_b).items():
         assert "secret-reviewer" not in text, f"raw commenter leaked into {rel}"
+
+    # Case C: Same-thread unmapped event whose contribution is NOT used in the story does NOT block.
+    home_c = _setup_hermes_home(tmp_path / "case_c")
+    _bind_hermes_env(monkeypatch, home_c)
+    kconn_c = _init_kanban_db(home_c / "kanban.db")
+    kconn_c.execute(
+        "INSERT INTO tasks (id, title, body, assignee, status, priority, created_by, created_at, started_at, completed_at, result) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "t-clean",
+            "Stabilize queue lock guard",
+            "Stabilize queue lock guard.",
+            "default",
+            "completed",
+            1,
+            "owner",
+            NOW - 5000,
+            NOW - 4800,
+            NOW - 3800,
+            "Fixed the queue lock cleanly.",
+        ),
+    )
+    for kind_val, ts_val, note in (
+        ("blocked", NOW - 4700, "worker step 0"),
+        ("unblocked", NOW - 4640, "worker step 1"),
+        ("blocked", NOW - 4200, "worker step 2"),
+        ("completed", NOW - 4100, "worker step 3"),
+    ):
+        kconn_c.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+            ("t-clean", kind_val, json.dumps({"note": note}), ts_val),
+        )
+    for msg, ts_val in (
+        ("Checked the queue lock guard and found no timeout.", NOW - 4550),
+        ("Added clean retry guard across the queue worker.", NOW - 4450),
+        ("Verified queue tests stay green after restart.", NOW - 4350),
+    ):
+        kconn_c.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+            ("t-clean", "default", msg, ts_val),
+        )
+    # Same-thread unmapped background run and short ack comment (unused by brief/arc/facts).
+    kconn_c.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+        ("t-clean", "secret-unused", "ack", NOW - 4310),
+    )
+    kconn_c.execute(
+        "INSERT INTO task_runs (task_id, profile, step_key, status, started_at, ended_at, outcome, summary, error) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("t-clean", "secret-unused", "bg-probe", "ok", NOW - 4300, NOW - 4290, "ok", "", ""),
+    )
+    kconn_c.commit()
+    kconn_c.close()
+
+    writer_c = _RecordingLLM()
+    data_c = tmp_path / "data_c"
+    res_c = pl.run_pipeline(
+        pl.PipelineConfig(
+            data_dir=data_c,
+            state_dir=tmp_path / "state_c",
+            assets_dir=assets,
+            cast_config=cfg_a,
+            all_profiles=True,
+            wording="meaning",
+            min_strip_panels=1,
+            use_model=True,
+            writer_llm=writer_c,
+        )
+    )
+    assert res_c.events_ingested >= 12
+    assert res_c.problems == [], res_c.problems
+    assert len(res_c.episodes) == 1
+    assert res_c.cast_diagnostics == []
+    assert "secret-unused" not in json.dumps(writer_c.calls)
+    assert "unmapped-role-" not in json.dumps(writer_c.calls)
+    assert "unmapped-role-" not in (data_c / "script-ir-1.json").read_text(encoding="utf-8")
+    assert "unmapped-role-" not in (data_c / "episode-1-script.md").read_text(encoding="utf-8")
+    for rel, text in _all_text_under(data_c).items():
+        assert "secret-unused" not in text, f"unused same-thread profile leaked into {rel}"
+
+    # Case D: Relied-on unmapped episode skips ONLY that episode before writing and continues with eligible ones.
+    home_d = _setup_hermes_home(tmp_path / "case_d", default_turns=_default_story_turns("worker"))
+    _bind_hermes_env(monkeypatch, home_d)
+    _add_session(
+        home_d / "profiles" / "secret-guest" / "state.db",
+        session_id="sess-guest-newest",
+        profile_name="secret-guest",
+        title="Guest urgent incident",
+        turns=_default_story_turns("zebra-incident"),
+        base_ts=NOW - 1800,
+    )
+    writer_d = _RecordingLLM()
+    data_d = tmp_path / "data_d"
+    rc_d = _run_cli_plan(
+        data_d,
+        writer_llm=writer_d,
+        cast_config=cfg_a,
+        all_profiles=True,
+        extra_args=["--episodes", "2"],
+    )
+    out_d = capsys.readouterr().out
+    assert rc_d == 0
+    assert "hermes:secret-guest" in out_d
+    assert "zebra-incident" not in json.dumps(writer_d.calls)
+    assert "secret-guest" not in json.dumps(writer_d.calls)
+    metrics_d = json.loads((data_d / "metrics.json").read_text(encoding="utf-8"))
+    assert len(metrics_d["episodes"]) == 1
+    assert any("unmapped-role-" in row["reason"] for row in metrics_d["skipped_stories"])
+    for rel, text in _all_text_under(data_d).items():
+        assert "secret-guest" not in text, f"raw profile leaked into {rel}"
 
 
 def test_series_and_cache_isolation_across_cast_revisions(tmp_path, monkeypatch):
@@ -859,6 +983,7 @@ def test_series_and_cache_isolation_across_cast_revisions(tmp_path, monkeypatch)
     assets = tmp_path / "assets"
     _make_kit(assets, "placeholder-lead", "Rowan")
     _make_kit(assets, "placeholder-alt", "Maren")
+    _make_kit(assets, "placeholder-claude", "Cinder")
 
     cfg_v1 = _write_cast_config(
         tmp_path / "cast-v1.json",
@@ -881,24 +1006,89 @@ def test_series_and_cache_isolation_across_cast_revisions(tmp_path, monkeypatch)
         )
     )
     assert res1.problems == []
-    assert (data_dir / "series-continuity.json").is_file()
+    series_path = data_dir / "series-continuity.json"
+    assert series_path.is_file()
     assert not (data_dir / SERIES_FILE).exists()
-    loaded = load_series(data_dir / "series-continuity.json")
+    assert "hermes:default" not in series_path.read_text(encoding="utf-8")
+    loaded = load_series(series_path)
     assert loaded.series_id == "continuity"
     assert loaded.cast_digest
+    assert loaded.cast_roles
     assert len(loaded.chapters) == 1
     assert (data_dir / "cache" / f"cast-continuity-{loaded.cast_digest}").is_dir()
 
-    # Changing owner/cast under the same series_id + data_dir must fail preflight with 0 LLM calls.
+    # Adding a co-star later in the same series is allowed cleanly (new cache dir, preserved series).
+    _add_session(
+        home / "profiles" / "claude" / "state.db",
+        session_id="sess-claude-later",
+        profile_name="claude",
+        title="Second episode with Cinder",
+        turns=_default_story_turns("router"),
+        base_ts=NOW - 3600,
+    )
+    cfg_added_costar = _write_cast_config(
+        tmp_path / "cast-v1b.json",
+        series_id="continuity",
+        assets_dir=str(assets),
+        owner={"name": "Rowan", "kit": "placeholder-lead"},
+        roles={
+            "hermes:default": {"name": "Kensei", "kit": "kensei"},
+            "hermes:claude": {"name": "Cinder", "kit": "placeholder-claude"},
+        },
+    )
+    res1b = pl.run_pipeline(
+        pl.PipelineConfig(
+            data_dir=data_dir,
+            state_dir=state_dir,
+            cast_config=cfg_added_costar,
+            all_profiles=True,
+            min_strip_panels=4,
+            use_model=True,
+            writer_llm=_RecordingLLM(),
+        )
+    )
+    assert res1b.problems == []
+    loaded_b = load_series(series_path)
+    assert loaded_b.cast_digest != loaded.cast_digest
+    assert len(loaded_b.chapters) == 2
+    assert (data_dir / "cache" / f"cast-continuity-{loaded_b.cast_digest}").is_dir()
+    assert "hermes:claude" not in series_path.read_text(encoding="utf-8")
+
+    # Removing an existing role under the same series_id must fail preflight with 0 LLM calls.
+    cfg_removed = _write_cast_config(
+        tmp_path / "cast-removed.json",
+        series_id="continuity",
+        assets_dir=str(assets),
+        owner={"name": "Rowan", "kit": "placeholder-lead"},
+        roles={"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+    )
+    writer_removed = _RecordingLLM()
+    with pytest.raises(CastConfigError, match="removed"):
+        pl.run_pipeline(
+            pl.PipelineConfig(
+                data_dir=data_dir,
+                state_dir=state_dir,
+                cast_config=cfg_removed,
+                min_strip_panels=4,
+                use_model=True,
+                writer_llm=writer_removed,
+            )
+        )
+    assert writer_removed.calls == []
+
+    # Changing owner/existing role under the same series_id + data_dir must fail preflight with 0 LLM calls.
     cfg_v2_same_id = _write_cast_config(
         tmp_path / "cast-v2.json",
         series_id="continuity",
         assets_dir=str(assets),
         owner={"name": "Maren", "kit": "placeholder-alt"},
-        roles={"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+        roles={
+            "hermes:default": {"name": "Kensei", "kit": "kensei"},
+            "hermes:claude": {"name": "Cinder", "kit": "placeholder-claude"},
+        },
     )
     writer_blocked = _RecordingLLM()
-    with pytest.raises(CastConfigError, match="cast revision changed"):
+    with pytest.raises(CastConfigError, match="cast binding changed"):
         pl.run_pipeline(
             pl.PipelineConfig(
                 data_dir=data_dir,

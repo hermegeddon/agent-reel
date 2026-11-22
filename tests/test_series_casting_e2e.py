@@ -445,7 +445,10 @@ def test_e2e_cli_multi_harness_plan_and_dual_source_render_with_zero_leaks(tmp_p
         ir_path = plan_dir / f"script-ir-{ep_num}.json"
         assert ir_path.is_file()
         ir_json = json.loads(ir_path.read_text(encoding="utf-8"))
-        seen_agents |= (set(ir_json["cast_binding"]["characters"]) - {"Rowan"})
+        chars = ir_json["cast_binding"]["characters"]
+        if "Rowan" in chars:
+            assert chars["Rowan"]["lead"] is True
+        seen_agents |= (set(chars) - {"Rowan"})
     assert seen_agents == {"Kensei", "Cinder", "Tally", "Rook"}
 
     # Warm-cache determinism check: second plan run with warm cache dir makes 0 LLM calls and matches episode 1.

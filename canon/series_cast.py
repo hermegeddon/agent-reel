@@ -29,7 +29,7 @@ RESERVED_DISPLAY_NAMES = frozenset(
 _TOP_LEVEL_KEYS = frozenset({"schema_version", "series_id", "assets_dir", "owner", "roles"})
 _MEMBER_KEYS = frozenset({"name", "kit", "voice"})
 _BINDING_KEYS = frozenset({"schema_version", "series_id", "cast_digest", "characters"})
-_BINDING_CHAR_KEYS = frozenset({"kit", "owner"})
+_BINDING_CHAR_KEYS = frozenset({"kit", "lead"})
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -82,10 +82,21 @@ class SeriesCastConfig:
 
     def summary_entries(self) -> list[dict[str, Any]]:
         """Shareable cast summary: display names and kit slugs only, never raw role keys."""
-        entries = [{"character": self.owner.name, "kit": self.owner.kit, "owner": True}]
+        entries = [{"character": self.owner.name, "kit": self.owner.kit, "lead": True}]
         for role_key in sorted(self.roles):
             member = self.roles[role_key]
-            entries.append({"character": member.name, "kit": member.kit, "owner": False})
+            entries.append({"character": member.name, "kit": member.kit, "lead": False})
+        return entries
+
+    def ledger_roles(self) -> dict[str, dict[str, Any]]:
+        """Privacy-safe role slot table stored in the series ledger for additive compatibility checks."""
+        entries: dict[str, dict[str, Any]] = {
+            "owner": {"name": self.owner.name, "kit": self.owner.kit, "lead": True}
+        }
+        for role_key in sorted(self.roles):
+            member = self.roles[role_key]
+            slot = f"role:{hashlib.sha256(role_key.encode('utf-8')).hexdigest()[:16]}"
+            entries[slot] = {"name": member.name, "kit": member.kit, "lead": False}
         return entries
 
 
@@ -310,13 +321,16 @@ def sanitize_profile_value(
 
 
 def build_cast_binding(config: SeriesCastConfig, display_names: Iterable[str]) -> dict[str, Any]:
-    """Build the shareable episode ``cast_binding`` receipt with display names -> kit slugs only."""
+    """Build the shareable episode ``cast_binding`` receipt with display names -> kit slugs only.
+
+    ``lead`` indicates narrative lead in the episode and never implies likeness consent.
+    """
     characters: dict[str, dict[str, Any]] = {}
     for name in display_names:
         member = config.member_by_display_name(name)
         if member is None:
             raise CastConfigError(f"episode character {name!r} has no mapping in series cast {config.series_id!r}")
-        characters[member.name] = {"kit": member.kit, "owner": member.owner}
+        characters[member.name] = {"kit": member.kit, "lead": member.owner}
     return {
         "schema_version": CAST_BINDING_SCHEMA_VERSION,
         "series_id": config.series_id,
@@ -362,10 +376,10 @@ def parse_cast_binding(raw: Any) -> dict[str, Any]:
         if extra:
             raise CastConfigError(f"cast_binding entry for {valid_name!r} has unknown key(s): {', '.join(extra)}")
         kit_slug = _validate_kit_slug(entry.get("kit"), f"cast_binding[{valid_name!r}]")
-        owner_flag = entry.get("owner")
-        if type(owner_flag) is not bool:
-            raise CastConfigError(f"cast_binding entry for {valid_name!r} requires boolean 'owner'")
-        characters[valid_name] = {"kit": kit_slug, "owner": owner_flag}
+        lead_flag = entry.get("lead")
+        if type(lead_flag) is not bool:
+            raise CastConfigError(f"cast_binding entry for {valid_name!r} requires boolean 'lead'")
+        characters[valid_name] = {"kit": kit_slug, "lead": lead_flag}
 
     return {
         "schema_version": CAST_BINDING_SCHEMA_VERSION,

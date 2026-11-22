@@ -180,13 +180,18 @@ def build_facts(
 
     # goal
     goal = str(getattr(brief, "goal", "") or "")
-    goal_event = next(
-        (
-            event_id
-            for event_id in events_by_id
-            if text_of(event_id) and text_of(event_id) in goal
-        ),
-        "",
+    goal_id = str(getattr(brief, "goal_event_id", "") or "")
+    goal_event = (
+        goal_id
+        if goal_id and goal_id in events_by_id
+        else next(
+            (
+                event_id
+                for event_id in events_by_id
+                if text_of(event_id) and text_of(event_id) in goal
+            ),
+            "",
+        )
     )
     if goal:
         actor = (
@@ -231,9 +236,14 @@ def build_facts(
 
     # outcome: one fact per clause, so the numbers survive into the strip
     outcome = str(getattr(brief, "outcome", "") or "")
-    outcome_event = next(
-        (event_id for event_id in events_by_id if text_of(event_id) and text_of(event_id) in outcome),
-        "",
+    outcome_id = str(getattr(brief, "outcome_event_id", "") or "")
+    outcome_event = (
+        outcome_id
+        if outcome_id and outcome_id in events_by_id
+        else next(
+            (event_id for event_id in events_by_id if text_of(event_id) and text_of(event_id) in outcome),
+            "",
+        )
     )
     actor = (
         _actor_for(events_by_id[outcome_event], table, hero)

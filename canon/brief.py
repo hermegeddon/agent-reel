@@ -108,6 +108,8 @@ class ThreadBrief:
     goal: str = ""
     turns: tuple[BriefTurn, ...] = ()
     outcome: str = ""
+    goal_event_id: str = ""
+    outcome_event_id: str = ""
     dropped: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
 
@@ -231,84 +233,21 @@ def _key_turns(events: Sequence[GatedEvent], *, limit: int = MAX_TURNS) -> tuple
     )
 
 
-def build_brief(
-    thread_key: str,
-    kind: str,
+def entail_brief(
+    brief: ThreadBrief,
     events: Iterable[GatedEvent],
-    *,
-    gate: Any | None = None,
-    max_turns: int = MAX_TURNS,
+    gate: Any,
 ) -> ThreadBrief:
-    """Build a gated brief, dropping any line the events do not support."""
+    """Entailment-check every line of ``brief`` against ``events``, clearing unsupported fields."""
+    if gate is None:
+        return brief
     rows = require_gated(list(events), stage="brief")
     rows.sort(key=lambda event: event.ts)
     evidence = _thread_evidence(rows)
-
-    goal = ""
-    outcome = ""
-    if kind == "session":
-        user_row = next(
-            (
-                row
-                for row in rows
-                if row.kind == KIND_MESSAGE_USER
-                and is_story_event(row)
-                and len(event_text(row)) >= MIN_GOAL_CHARS
-                and not event_text(row).startswith("/")
-            ),
-            None,
-        )
-        goal = event_text(user_row) if user_row is not None else ""
-        # R4-F2: the outcome is the message that actually says what happened - a result,
-        # a number, a completion - not necessarily the last thing said ("Go received").
-        candidates = [
-            row
-            for row in rows
-            if row.kind == KIND_MESSAGE_ASSISTANT
-            and is_story_event(row)
-            and len(event_text(row)) >= MIN_OUTCOME_CHARS
-        ]
-        outcome_row = max(candidates, key=_outcome_score, default=None)
-        outcome = event_text(outcome_row) if outcome_row is not None else ""
-    else:
-        created = next(
-            (row for row in rows if row.kind == KIND_TASK_CREATED and is_story_event(row)), None
-        )
-        if created is not None:
-            goal = event_text(created)
-        if not goal:
-            goal = next((event_text(row) for row in rows if is_story_event(row)), "")
-        finished = next(
-            (
-                event_text(row)
-                for row in reversed(rows)
-                if is_story_event(row)
-                and row.kind == KIND_TASK_FINISHED
-                or (row.kind == KIND_TASK_STATUS and str((row.payload or {}).get("kind")) == "completed")
-                or (row.kind == KIND_TASK_COMMENT and event_text(row))
-            ),
-            "",
-        )
-        outcome = finished or ""
-
-    turns = _key_turns(rows, limit=max_turns)
-
-    brief = ThreadBrief(
-        thread_key=thread_key,
-        kind=kind,
-        goal=strip_internal_ids(goal),
-        turns=turns,
-        outcome=strip_internal_ids(outcome),
-    )
-
-    if gate is None:
-        return brief
-
-    # Entailment-check every line against the thread's own text.
-    dropped: list[str] = []
-    reasons: list[str] = []
-
     haystack = " ".join(evidence.lower().split())
+
+    dropped: list[str] = list(brief.dropped)
+    reasons: list[str] = list(brief.reasons)
 
     def check(line: str, label: str) -> bool:
         if not line:
@@ -328,10 +267,97 @@ def build_brief(
 
     if brief.goal and not check(brief.goal, "goal"):
         brief.goal = ""
+        brief.goal_event_id = ""
     if brief.outcome and not check(brief.outcome, "outcome"):
         brief.outcome = ""
-    kept_turns = tuple(turn for turn in brief.turns if check(turn.text, f"turn {turn.event_id}"))
-    brief.turns = kept_turns
+        brief.outcome_event_id = ""
+    brief.turns = tuple(turn for turn in brief.turns if check(turn.text, f"turn {turn.event_id}"))
     brief.dropped = tuple(dropped)
     brief.reasons = tuple(reasons)
     return brief
+
+
+def build_brief(
+    thread_key: str,
+    kind: str,
+    events: Iterable[GatedEvent],
+    *,
+    gate: Any | None = None,
+    max_turns: int = MAX_TURNS,
+) -> ThreadBrief:
+    """Build a gated brief, dropping any line the events do not support."""
+    rows = require_gated(list(events), stage="brief")
+    rows.sort(key=lambda event: event.ts)
+
+    goal = ""
+    goal_event_id = ""
+    outcome = ""
+    outcome_event_id = ""
+    if kind == "session":
+        user_row = next(
+            (
+                row
+                for row in rows
+                if row.kind == KIND_MESSAGE_USER
+                and is_story_event(row)
+                and len(event_text(row)) >= MIN_GOAL_CHARS
+                and not event_text(row).startswith("/")
+            ),
+            None,
+        )
+        if user_row is not None:
+            goal = event_text(user_row)
+            goal_event_id = user_row.id
+        # R4-F2: the outcome is the message that actually says what happened - a result,
+        # a number, a completion - not necessarily the last thing said ("Go received").
+        candidates = [
+            row
+            for row in rows
+            if row.kind == KIND_MESSAGE_ASSISTANT
+            and is_story_event(row)
+            and len(event_text(row)) >= MIN_OUTCOME_CHARS
+        ]
+        outcome_row = max(candidates, key=_outcome_score, default=None)
+        if outcome_row is not None:
+            outcome = event_text(outcome_row)
+            outcome_event_id = outcome_row.id
+    else:
+        created = next(
+            (row for row in rows if row.kind == KIND_TASK_CREATED and is_story_event(row)), None
+        )
+        goal_row = created
+        if goal_row is None or not event_text(goal_row):
+            fallback_row = next((row for row in rows if is_story_event(row)), None)
+            if fallback_row is not None:
+                goal_row = fallback_row
+        if goal_row is not None:
+            goal = event_text(goal_row)
+            goal_event_id = goal_row.id
+        finished_row = next(
+            (
+                row
+                for row in reversed(rows)
+                if (is_story_event(row) and row.kind == KIND_TASK_FINISHED)
+                or (row.kind == KIND_TASK_STATUS and str((row.payload or {}).get("kind")) == "completed")
+                or (row.kind == KIND_TASK_COMMENT and event_text(row))
+            ),
+            None,
+        )
+        if finished_row is not None:
+            outcome = event_text(finished_row)
+            outcome_event_id = finished_row.id
+
+    turns = _key_turns(rows, limit=max_turns)
+
+    brief = ThreadBrief(
+        thread_key=thread_key,
+        kind=kind,
+        goal=strip_internal_ids(goal),
+        turns=turns,
+        outcome=strip_internal_ids(outcome),
+        goal_event_id=goal_event_id,
+        outcome_event_id=outcome_event_id,
+    )
+    if gate is None:
+        return brief
+    return entail_brief(brief, rows, gate)

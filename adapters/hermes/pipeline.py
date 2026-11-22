@@ -31,12 +31,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Iterable, Sequence
 
-from canon.brief import CHAPTER_MAX_TURNS, MAX_TURNS, build_brief
+from canon.brief import CHAPTER_MAX_TURNS, MAX_TURNS, build_brief, entail_brief
 from canon.story import DEFAULT_VOICES, edit_script, jobs_for, write_synopsis
 from canon.selection import select_stories
 from canon.threads import beats_by_thread, thread_index
-from canon.arcs import build_brief_arc
-from canon.arcs import build_arc, build_arcs, classify_arc_type, turn_texts
+from canon.arcs import ARC_ROLES, build_arc, build_arcs, build_brief_arc, classify_arc_type, turn_texts
 from canon.beats import Beat, beats_from_events
 from canon.cache import ModelCache
 from canon.aliases import AliasBook, apply_to_ir, masks_in
@@ -46,6 +45,7 @@ from canon.caption import compose_caption, trim_caption
 from canon.casting import build_cast_map, summarise as summarise_cast
 from canon.facts import build_facts, facts_text
 from canon.episode import (
+    CHAPTER_MAX_STORY,
     EpisodeRefused,
     EpisodeIR,
     LLMDialogueWriter,
@@ -521,6 +521,7 @@ def validate_cast_setup(
         load_series(series_path),
         series_id=cast_cfg.series_id,
         cast_digest=cast_cfg.cast_digest,
+        cast_roles=cast_cfg.ledger_roles(),
     )
     return cast_cfg, kits
 
@@ -633,6 +634,39 @@ def _primary_agent_for_episode(participating: set[str], cast_cfg: SeriesCastConf
     if "hermes:default" in cast_cfg.roles:
         return cast_cfg.roles["hermes:default"].name
     return cast_cfg.owner.name
+
+
+def _episode_panel_beats(
+    arc: Any,
+    all_beats: Sequence[Beat],
+    brief: Any,
+    evidence: Mapping[str, str],
+    *,
+    fmt: str,
+) -> list[Beat]:
+    """Return the exact beats that feed story panels for ``arc``."""
+    beat_index = {beat.id: beat for beat in all_beats}
+    brief_text_ids = {
+        turn.event_id
+        for turn in (getattr(brief, "turns", ()) or ())
+        if getattr(turn, "event_id", "") and str(evidence.get(turn.event_id, "")).strip()
+    }
+    panel_beats = [
+        beat_index[arc.roles[role]]
+        for role in ARC_ROLES
+        if role in arc.roles
+        and arc.roles[role] in beat_index
+        and any(eid in brief_text_ids for eid in beat_index[arc.roles[role]].event_ids)
+    ]
+    if fmt == "chapter":
+        used = set(arc.roles.values())
+        extra = [
+            beat
+            for beat in all_beats
+            if beat.id not in used and any(eid in brief_text_ids for eid in beat.event_ids)
+        ][: max(0, CHAPTER_MAX_STORY - len(panel_beats))]
+        panel_beats.extend(extra)
+    return panel_beats
 
 
 def run_pipeline(
@@ -1032,27 +1066,13 @@ def run_pipeline(
                 skipped.append({"key": candidate.key, "reason": "no thread for this story"})
                 continue
             t_events = thread_events.get(thread.id, [])
-            participating: set[str] = set()
-            if cast_cfg is not None:
-                thread_ids_all = {ev.id for ev in t_events} | set(candidate.event_ids)
-                participating = (
-                    {actor_role_by_id.get(eid, "") for eid in thread_ids_all}
-                    | {agent_role_by_id.get(eid, "") for eid in thread_ids_all}
-                ) - {""}
-                unmapped = sorted(r for r in participating if r != "owner" and r not in cast_cfg.roles)
-                if unmapped:
-                    opaque = ", ".join(opaque_role_id(r) for r in unmapped)
-                    skipped.append({"key": candidate.key, "reason": f"unmapped participating role ({opaque})"})
-                    result.cast_diagnostics.append(
-                        f"candidate {candidate.key}: unmapped participating role(s): {', '.join(unmapped)}"
-                    )
-                    continue
-            # R3-F2: the brief is the story spine, built from the thread's own text.
+            # R3-F2: build deterministic brief, arc, panel beats, and facts first (0 LLM calls)
+            # so participation gating reflects what this episode actually relies on.
             brief = build_brief(
                 thread.key,
                 thread.kind,
                 t_events,
-                gate=grounder if config.use_model else None,
+                gate=None,
                 max_turns=CHAPTER_MAX_TURNS if config.format == "chapter" else MAX_TURNS,
             )
             if not brief.ok:
@@ -1069,7 +1089,7 @@ def run_pipeline(
                 )
                 continue
             thread_beats = grouped_beats.get(thread.id, [])
-            thread_event_map = {event.id: event for event in thread_events.get(thread.id, [])}
+            thread_event_map = {event.id: event for event in t_events}
             # R3-F3: panels are anchored on beats that carry gated text. A kanban thread
             # has lifecycle beats; a session thread usually has too few, so its beats
             # are built from the brief itself (round 4).
@@ -1083,10 +1103,84 @@ def run_pipeline(
             if arc is None:
                 skipped.append({"key": candidate.key, "reason": "no arc"})
                 continue
+            target_arc = (
+                _trim_arc(arc, config.strip_panels)
+                if (config.format == "strip" and config.strip_panels)
+                else arc
+            )
+            all_arc_beats = story_beats or thread_beats
+            panel_beats = _episode_panel_beats(
+                target_arc, all_arc_beats, brief, evidence_map, fmt=config.format
+            )
+            thread_facts = build_facts(
+                brief, thread_event_map, display=cast_map, hero=effective_hero
+            )
+
+            participating: set[str] = set()
+            if cast_cfg is not None:
+                relied_event_ids = (
+                    ({brief.goal_event_id} if brief.goal_event_id else set())
+                    | ({brief.outcome_event_id} if brief.outcome_event_id else set())
+                    | {turn.event_id for turn in brief.turns if turn.event_id}
+                    | {eid for beat in panel_beats for eid in beat.event_ids}
+                    | {fact.event_id for fact in thread_facts if fact.event_id}
+                )
+                participating = (
+                    {actor_role_by_id.get(eid, "") for eid in relied_event_ids}
+                    | {agent_role_by_id.get(eid, "") for eid in relied_event_ids}
+                ) - {""}
+                unmapped = sorted(r for r in participating if r != "owner" and r not in cast_cfg.roles)
+                if unmapped:
+                    opaque = ", ".join(opaque_role_id(r) for r in unmapped)
+                    skipped.append({"key": candidate.key, "reason": f"unmapped participating role ({opaque})"})
+                    result.cast_diagnostics.append(
+                        f"candidate {candidate.key}: unmapped participating role(s): {', '.join(unmapped)}"
+                    )
+                    continue
+                story_t_events = [ev for ev in t_events if _is_mapped_event(ev.id)]
+                episode_beats: Sequence[Beat] = [
+                    beat for beat in all_arc_beats if all(_is_mapped_event(eid) for eid in beat.event_ids)
+                ]
+                # Rebuild arc from mapped beats/events if unused unmapped beats were stripped.
+                if len(episode_beats) != len(all_arc_beats):
+                    story_event_map_mapped = {event.id: event for event in story_t_events}
+                    if usable_anchor_count(episode_beats, brief=brief, evidence=evidence_map) >= 3:
+                        arc = build_arc(
+                            episode_beats, thread=thread, events_by_id=story_event_map_mapped
+                        )
+                    else:
+                        arc, episode_beats = build_brief_arc(brief, story_event_map_mapped)
+                    if arc is None:
+                        skipped.append({"key": candidate.key, "reason": "no arc"})
+                        continue
+            else:
+                story_t_events = t_events
+                episode_beats = all_arc_beats
+
+            if config.use_model:
+                brief = entail_brief(brief, story_t_events, grounder)
+                if not brief.ok:
+                    missing = [
+                        name for name, value in (("goal", brief.goal), ("outcome", brief.outcome)) if not value
+                    ]
+                    skipped.append(
+                        {
+                            "key": candidate.key,
+                            "reason": f"brief not usable ({len(brief.turns)} turns"
+                            + (f"; no {' or '.join(missing)}" if missing else "")
+                            + ")",
+                        }
+                    )
+                    continue
+                story_event_map = {event.id: event for event in story_t_events}
+                thread_facts = build_facts(
+                    brief, story_event_map, display=cast_map, hero=effective_hero
+                )
+
             # The shape of the story is read from what actually happened, not assumed.
             arc = replace(arc, type=classify_arc_type(goal=brief.goal, turns=turn_texts(brief), outcome=brief.outcome))
             # R4-F5: two episodes in one run must not stand on the same events.
-            beat_index = {beat.id: beat for beat in (story_beats or thread_beats)}
+            beat_index = {beat.id: beat for beat in episode_beats}
             anchor_events = {
                 event_id
                 for beat_id in arc.roles.values()
@@ -1099,25 +1193,26 @@ def run_pipeline(
                 continue
             owner_texts = tuple(
                 str((event.payload or {}).get("text", ""))
-                for event in thread_events.get(thread.id, [])
+                for event in story_t_events
                 if str((event.payload or {}).get("role", "")) == "user"
                 and str((event.payload or {}).get("text", "")).strip()
             )
             outcome_caption = ""
             if brief.outcome:
-                for event in thread_events.get(thread.id, []):
+                for event in story_t_events:
                     if str((event.payload or {}).get("text", "")).strip() == brief.outcome.strip():
                         outcome_caption = compose_caption(event, display=cast_map, hero=effective_hero)
                         break
                 if not outcome_caption:
                     outcome_caption = trim_caption(brief.outcome)
-            thread_facts = build_facts(
-                brief, thread_event_map, display=cast_map, hero=effective_hero
-            )
             thread_facts_text = facts_text(thread_facts)
             thread_evidence_text = "\n".join(
                 [brief.text()]
-                + [evidence_map.get(event_id, "") for event_id in candidate.event_ids]
+                + [
+                    evidence_map.get(event_id, "")
+                    for event_id in candidate.event_ids
+                    if cast_cfg is None or _is_mapped_event(event_id)
+                ]
             )
             # R5-F4: if the model title fails grounding, fall back to the thread title
             # shortened on a word boundary - never to the owner's own message.
@@ -1130,7 +1225,7 @@ def run_pipeline(
             derived_title = trim_caption(raw_title, max_words=6)
             title, title_source = write_title(
                 writer_cached if config.use_model else None,
-                beats=story_beats or thread_beats,
+                beats=episode_beats,
                 derived=derived_title,
                 hero=effective_hero,
                 gate=grounder,
@@ -1152,7 +1247,7 @@ def run_pipeline(
             def _plan(episode_writer: Any, layer: str = "caption") -> EpisodeIR:
                 return plan_episode(
                     arc,
-                    story_beats or thread_beats,
+                    episode_beats,
                     canon,
                     format=config.format,
                     season=config.season,
@@ -1301,7 +1396,7 @@ def run_pipeline(
                     "planned_ir": planned_ir,
                     "arc": arc,
                     # The beats the episode was actually planned from (t_abdaa3a9).
-                    "story_beats": tuple(story_beats or thread_beats or ()),
+                    "story_beats": tuple(episode_beats),
                     "story": story_info,
                 }
             )
@@ -1337,6 +1432,7 @@ def run_pipeline(
         if cast_cfg is not None:
             series.series_id = cast_cfg.series_id
             series.cast_digest = cast_cfg.cast_digest
+            series.cast_roles = cast_cfg.ledger_roles()
         save_series(series_path, series)
         result.episodes = [
             {key: value for key, value in row.items() if key not in {"ir", "planned_ir", "arc", "story_beats", "story", "fact_sources"}}

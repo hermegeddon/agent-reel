@@ -112,8 +112,8 @@ def _sample_ir(
                 "series_id": "render-series",
                 "cast_digest": "abcd1234ef567890",
                 "characters": {
-                    hero: {"kit": "placeholder-lead", "owner": True},
-                    **({agent: {"kit": "kensei", "owner": False}} if len(characters) > 1 else {}),
+                    hero: {"kit": "placeholder-lead", "lead": True},
+                    **({agent: {"kit": "kensei", "lead": False}} if len(characters) > 1 else {}),
                 },
             }
         )
@@ -333,12 +333,13 @@ def test_malformed_cast_binding_or_missing_kit_fails_preflight_zero_image_calls(
     _approve_all(assets, [("placeholder-lead", "anime"), ("kensei", "anime")])
 
     bad_bindings = [
-        {"schema_version": 2, "series_id": "s", "cast_digest": "abc", "characters": {"Rowan": {"kit": "placeholder-lead", "owner": True}}},
-        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "extra": 1, "characters": {"Rowan": {"kit": "placeholder-lead", "owner": True}}},
-        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "characters": {"hermes:default": {"kit": "kensei", "owner": False}}},
-        {"schema_version": 1, "series_id": "s", "cast_digest": "", "characters": {"Rowan": {"kit": "placeholder-lead", "owner": True}}},
-        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "characters": {"Rowan": {"kit": "placeholder-lead", "owner": True}}},  # missing Kensei
-        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "characters": {"Rowan": {"kit": "nonexistent-kit", "owner": True}, "Kensei": {"kit": "kensei", "owner": False}}},
+        {"schema_version": 2, "series_id": "s", "cast_digest": "abc", "characters": {"Rowan": {"kit": "placeholder-lead", "lead": True}}},
+        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "extra": 1, "characters": {"Rowan": {"kit": "placeholder-lead", "lead": True}}},
+        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "characters": {"Rowan": {"kit": "placeholder-lead", "owner": True}}},
+        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "characters": {"hermes:default": {"kit": "kensei", "lead": False}}},
+        {"schema_version": 1, "series_id": "s", "cast_digest": "", "characters": {"Rowan": {"kit": "placeholder-lead", "lead": True}}},
+        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "characters": {"Rowan": {"kit": "placeholder-lead", "lead": True}}},  # missing Kensei
+        {"schema_version": 1, "series_id": "s", "cast_digest": "abc", "characters": {"Rowan": {"kit": "nonexistent-kit", "lead": True}, "Kensei": {"kit": "kensei", "lead": False}}},
     ]
 
     for idx, binding in enumerate(bad_bindings):
@@ -394,8 +395,8 @@ def test_approved_identity_fallback_clears_on_experimental_style(tmp_path, monke
             "series_id": "exp-style",
             "cast_digest": "1122334455667788",
             "characters": {
-                "Rowan": {"kit": "placeholder-lead", "owner": True},
-                "Vex": {"kit": "placeholder-vex", "owner": False},
+                "Rowan": {"kit": "placeholder-lead", "lead": True},
+                "Vex": {"kit": "placeholder-vex", "lead": False},
             },
         },
     )
@@ -426,8 +427,8 @@ def test_public_flag_refuses_real_person_kit_without_consent(tmp_path, monkeypat
             "series_id": "pub-gate",
             "cast_digest": "deadbeef12345678",
             "characters": {
-                "Rowan": {"kit": "placeholder-real", "owner": True},
-                "Kensei": {"kit": "kensei", "owner": False},
+                "Rowan": {"kit": "placeholder-real", "lead": True},
+                "Kensei": {"kit": "kensei", "lead": False},
             },
         }
     )
@@ -463,7 +464,7 @@ def test_request_key_manifest_sidecar_and_rule_fillers(tmp_path, monkeypatch):
     req_b = PanelRequest("p1", "prompt", (ref,), ("Rowan",), {"Rowan": "LEFT"}, "landscape", bindings={"Rowan": "kit-b"})
     assert request_key(req_a) != request_key(req_b)
 
-    # 2) _rule_fillers picks the cast_binding owner (`Zed`) over earlier-alphabetical `Astra` or hardcoded `Sahil`.
+    # 2) _rule_fillers picks the cast_binding narrative lead (`Zed`) over earlier-alphabetical `Astra` or hardcoded `Sahil`.
     ir = _sample_ir(
         characters=("Astra", "Zed"),
         cast_binding={
@@ -471,8 +472,8 @@ def test_request_key_manifest_sidecar_and_rule_fillers(tmp_path, monkeypatch):
             "series_id": "fillers",
             "cast_digest": "9988776655443322",
             "characters": {
-                "Zed": {"kit": "placeholder-zed", "owner": True},
-                "Astra": {"kit": "placeholder-astra", "owner": False},
+                "Zed": {"kit": "placeholder-zed", "lead": True},
+                "Astra": {"kit": "placeholder-astra", "lead": False},
             },
         },
     )
