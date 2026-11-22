@@ -8,6 +8,7 @@ from canon.brief import (
     build_brief,
     event_text,
     is_incidental_acknowledgement,
+    is_non_factual_chatter,
     is_story_event,
     materially_changes_outcome,
 )
@@ -197,7 +198,11 @@ def test_incidental_task_comment_after_completion_does_not_become_outcome_or_tur
         "Thanks for keeping me posted.",
         "Thanks for the update! ❤️",
         "Enjoy the rest of your evening!",
+        "Glad the bug is behind us. Thanks, everyone!",
+        "Great work, everyone! Have a great weekend!",
+        "Thanks again, team!",
     ):
+        assert is_non_factual_chatter(trailing), trailing
         assert not materially_changes_outcome(trailing), trailing
         comment = seal(
             build_event(
@@ -207,22 +212,31 @@ def test_incidental_task_comment_after_completion_does_not_become_outcome_or_tur
             ),
             {"task_id": "t2", "text": trailing},
         )
+        assert not is_story_event(comment), trailing
         brief = build_brief("t2", "task", base_rows + [comment])
         assert brief.outcome == "Fixed the queue lock cleanly."
         assert brief.outcome_event_id == base_rows[2].id
         assert all(turn.event_id != comment.id for turn in brief.turns)
 
-    blocker = "Hold release until retry check finishes."
-    assert materially_changes_outcome(blocker)
-    blocker_ev = seal(
-        build_event(
-            source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile="default", actor="reviewer",
-            subject="t2", payload={"task_id": "t2", "text": blocker},
-            store="kanban", table="task_comments", pk="t2-k3",
-        ),
-        {"task_id": "t2", "text": blocker},
-    )
-    blocked_brief = build_brief("t2", "task", base_rows + [blocker_ev])
-    assert blocked_brief.outcome == blocker
-    assert blocked_brief.outcome_event_id == blocker_ev.id
-    assert any(turn.event_id == blocker_ev.id for turn in blocked_brief.turns)
+    for material_comment in (
+        "Hold release until retry check finishes.",
+        "The queue is frozen again.",
+        "Users see blank pages on checkout.",
+        "Glad the bug is behind us, but the queue is frozen.",
+        "Glad the bug is behind us \u2014 did staging pass?",
+        "The bug is back.",
+    ):
+        assert not is_non_factual_chatter(material_comment), material_comment
+        assert materially_changes_outcome(material_comment), material_comment
+        blocker_ev = seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile="default", actor="reviewer",
+                subject="t2", payload={"task_id": "t2", "text": material_comment},
+                store="kanban", table="task_comments", pk=f"t2-k-{abs(hash(material_comment))}",
+            ),
+            {"task_id": "t2", "text": material_comment},
+        )
+        blocked_brief = build_brief("t2", "task", base_rows + [blocker_ev])
+        assert blocked_brief.outcome == material_comment
+        assert blocked_brief.outcome_event_id == blocker_ev.id
+        assert any(turn.event_id == blocker_ev.id for turn in blocked_brief.turns)

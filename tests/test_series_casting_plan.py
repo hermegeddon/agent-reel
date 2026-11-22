@@ -1493,3 +1493,50 @@ def test_repeated_explicit_episode_number_preserves_existing_plan(tmp_path, monk
     assert res2.episodes[0]["number"] == 11
     assert ep10_path.read_bytes() == ep10_bytes
     assert (data_dir / "script-ir-11.json").is_file()
+
+
+def test_uncasted_run_refuses_cast_configured_directory(tmp_path, monkeypatch):
+    home = _setup_hermes_home(tmp_path, default_turns=_default_story_turns())
+    _bind_hermes_env(monkeypatch, home)
+    assets = tmp_path / "assets"
+    _make_kit(assets, "maren-lead", "Maren")
+    cfg = _write_cast_config(
+        tmp_path / "cast.json",
+        series_id="uncasted-guard",
+        assets_dir=str(assets),
+        owner={"name": "Maren", "kit": "maren-lead"},
+        roles={"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+    )
+    data_dir = tmp_path / "data"
+    state_dir = tmp_path / "state"
+    res1 = pl.run_pipeline(
+        pl.PipelineConfig(
+            data_dir=data_dir,
+            state_dir=state_dir,
+            cast_config=cfg,
+            min_strip_panels=4,
+            use_model=True,
+            writer_llm=_RecordingLLM(),
+        )
+    )
+    assert res1.problems == []
+    ir1_bytes = (data_dir / "script-ir-1.json").read_bytes()
+    ir_bytes = (data_dir / "script-ir.json").read_bytes()
+    ledger_bytes = (data_dir / "series-uncasted-guard.json").read_bytes()
+
+    writer_uncasted = _RecordingLLM()
+    with pytest.raises(CastConfigError, match="cast-configured"):
+        pl.run_pipeline(
+            pl.PipelineConfig(
+                data_dir=data_dir,
+                state_dir=state_dir,
+                cast_config=None,
+                min_strip_panels=4,
+                use_model=True,
+                writer_llm=writer_uncasted,
+            )
+        )
+    assert writer_uncasted.calls == []
+    assert (data_dir / "script-ir-1.json").read_bytes() == ir1_bytes
+    assert (data_dir / "script-ir.json").read_bytes() == ir_bytes
+    assert (data_dir / "series-uncasted-guard.json").read_bytes() == ledger_bytes

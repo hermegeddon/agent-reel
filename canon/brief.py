@@ -58,6 +58,9 @@ MACHINERY_KINDS = frozenset({KIND_TOOL_CALL, KIND_MESSAGE_TOOL_RESULT})
 #: Internal identifiers are not narrative text.
 _INTERNAL_ID = re.compile(r"\b(?:local|session|ev|thr|proc)[-_][0-9a-f]{6,}\b")
 
+MAX_NON_FACTUAL_CHARS = 160
+MAX_NON_FACTUAL_SENTENCES = 4
+
 _ACK_GREETING = r"(?:(?:hi|hey|hello)(?:[,!.\s]+(?:team|all|folks|there|everyone))?[,!.\s]+)?"
 _ACK_PHRASE = (
     r"(?:ack|acknowledged|received|go received|copy(?: that)?|roger(?: that)?|"
@@ -69,7 +72,8 @@ _ACK_PHRASE = (
     r"following along|watching this|watching|subscribed)"
 )
 _ACK_TAIL = (
-    r"(?:[,!\s]+(?:all|team|folks|everyone|here|again|so much|very much|a lot))?"
+    r"(?:[,!\s]+(?:again|so much|very much|a lot))?"
+    r"(?:[,!\s]+(?:all|team|folks|everyone|here))?"
     r"(?:\s+for (?:"
     r"(?:the )?(?:update|updates|heads[- ]up|follow[- ]?up|note|notes|info|information|"
     r"ping|status|context|summary|sharing|checking|letting me know|looking into (?:it|this))|"
@@ -81,22 +85,68 @@ _INCIDENTAL_ACK = re.compile(
     re.IGNORECASE,
 )
 
-#: Signals that a post-completion comment alters or qualifies the recorded task result.
-_MATERIAL_OUTCOME = re.compile(
-    r"\b("
-    r"hold|wait|pause|stop|block(?:ed|ing)?|reopen(?:ed|ing)?|revert(?:ed|ing)?|"
-    r"roll\s*back|reject(?:ed|ing)?|fail(?:ed|s|ing|ure)?|broke(?:n)?|bug|regression|"
-    r"error|exception|traceback|crash(?:ed|es)?|time(?:d)?\s*out|retry|flaky|stuck|"
-    r"missing|wrong|mismatch|denied|refused|"
-    r"still\s+(?:see(?:s|ing)?|broken|failing|out|down|happening|repro\w*)|"
-    r"not\s+(?:fixed|resolved|done|working|ready|merged|deployed)|"
-    r"until|before\s+(?:release|deploy|merge|shipping)|"
-    r"must|needs?\s+to|requires?|require|sign[- ]?off|approv(?:e|ed|al)|decide|decision|go/no-go|"
-    r"do\s+not|don'?t\s+(?:merge|deploy|release|ship)|"
-    r"reproduced|verified|confirmed|superseded|replaced|amended|deployed|shipped|merged|passed|resolved"
+#: Whole-text veto for fail-closed post-completion filtering: questions, caveats, blockers,
+#: recurrence, negation, and failure/action cues never count as ignorable social chatter.
+#: Generic "bug"/"issue"/"problem" stay outside the veto so pure relief ("Glad the bug is
+#: behind us") can pass, while any factual claim ("The bug is back.") still fails grammar.
+_CAVEAT_OR_CONTRADICTION = re.compile(
+    r"\?|\b("
+    r"but|however|though|although|except|yet|still|"
+    r"(?<!thanks )(?<!thanks, )(?<!thank you )(?<!thank you, )(?<!thx )(?<!ty )again|"
+    r"back|returned|reoccur\w*|recur\w*|anymore|instead|unless|until|before|wait|hold|pause|stop|"
+    r"reopen\w*|revert\w*|roll\s*back|reject\w*|"
+    r"not|never|no\s+longer|doesn't|don't|didn't|isn't|aren't|wasn't|weren't|"
+    r"won't|can't|cannot|couldn't|shouldn't|"
+    r"frozen|freeze|freezing|hung|hang(?:s|ing)?|stuck|stall(?:ed|s|ing)?|"
+    r"deadlock(?:ed)?|wedged|down|offline|outage|crash(?:ed|es|ing)?|"
+    r"error(?:s)?|exception|traceback|fail(?:ed|s|ing|ure)?|broke(?:n)?|regression|"
+    r"time(?:d)?\s*out|timeout|retry|retries|flaky|mismatch|wrong|missing|denied|refused|"
+    r"unresponsive|repro\w*|block(?:ed|ing|er)?|incident|alert|panic|oom|slow|degraded|"
+    r"corrupt\w*|leak(?:ed|ing)?|dropped|lost|investigat\w*|verify|verifying|"
+    r"needs?\s+to|must|require[sd]?|sign[- ]?off|merge|deploy|release|ship"
     r")\b",
     re.IGNORECASE,
 )
+
+_RELIEF_CLOSER = re.compile(
+    r"^(?:(?:so|really|very)\s+)?"
+    r"(?:glad|happy|relieved|good|great|nice|awesome|wonderful)"
+    r"(?:\s+to\s+(?:see|hear))?(?:\s+that)?\s+"
+    r"(?:this|that|it|everything|all\s+of\s+(?:this|that)|"
+    r"(?:the|this|that)\s+(?:bug|issue|problem|thing|snag|headache|mess|one))"
+    r"(?:\s*(?:is|are|'s|'re))?\s+"
+    r"(?:(?:finally|all|now)\s+)?"
+    r"(?:behind\s+us|over|done|sorted(?:\s+out)?|settled|resolved|fixed|"
+    r"cleared(?:\s+up)?|handled|taken\s+care\s+of|wrapped\s+up|all\s+set|"
+    r"good\s+to\s+go|put\s+to\s+bed|out\s+of\s+the\s+way|closed|gone)"
+    r"(?:[,!\s]+(?:all|team|folks|everyone|guys))?$",
+    re.IGNORECASE,
+)
+
+_PRAISE_CLOSER = re.compile(
+    r"^(?:"
+    r"(?:great|good|nice|awesome|fantastic|amazing|solid|stellar|clean|superb|excellent)\s+"
+    r"(?:work|job|catch|stuff|effort|save|teamwork)|"
+    r"well\s+done|kudos|way\s+to\s+go|nicely\s+done|hats\s+off|bravo|congrats|congratulations"
+    r")(?:[,!\s]+(?:all|team|folks|everyone|guys|on\s+(?:this|that)(?:\s+one)?))?$",
+    re.IGNORECASE,
+)
+
+_FAREWELL_CLOSER = re.compile(
+    r"^(?:"
+    r"enjoy\s+(?:the\s+rest\s+of\s+)?(?:your|the)\s+(?:day|evening|night|afternoon|morning|weekend)|"
+    r"have\s+a\s+(?:great|good|nice|wonderful|restful|lovely)\s+"
+    r"(?:day|evening|night|afternoon|morning|weekend|rest\s+of\s+(?:your|the)\s+(?:day|week|weekend))|"
+    r"see\s+you\s+(?:all\s+)?(?:tomorrow|monday|next\s+week|later|soon)|"
+    r"talk\s+(?:to\s+you\s+)?(?:later|soon|tomorrow)|"
+    r"signing\s+off(?:\s+for\s+(?:the\s+day|now|tonight))?|"
+    r"good\s*(?:night|evening|weekend)"
+    r")(?:[,!\s]+(?:all|team|folks|everyone|guys))?$",
+    re.IGNORECASE,
+)
+
+_SENTENCE_SPLIT = re.compile(r"[.!?\n;]+")
+_CLAUSE_JOINER = re.compile(r"(?:\s+[-\u2014]\s+|\s+and\s+|,\s+)", re.IGNORECASE)
 
 
 def _strip_decorative_symbols(text: str) -> str:
@@ -105,20 +155,59 @@ def _strip_decorative_symbols(text: str) -> str:
     )
 
 
+def _normalize_comment(text: str) -> str:
+    cleaned = _strip_decorative_symbols(text).replace("\u2018", "'").replace("\u2019", "'")
+    return " ".join(cleaned.split())
+
+
 def is_incidental_acknowledgement(text: str) -> bool:
     """True for brief courtesy replies, receipts, or watch-list notes without story substance."""
-    clean = " ".join(_strip_decorative_symbols(text).split())
+    clean = _normalize_comment(text)
     if not clean or len(clean) > 100:
         return False
     return bool(_INCIDENTAL_ACK.match(clean))
 
 
-def materially_changes_outcome(text: str) -> bool:
-    """True when a task comment introduces a substantive hold, blocker, decision, or changed outcome."""
-    clean = " ".join(str(text or "").split())
-    if not clean or is_incidental_acknowledgement(clean):
+def _is_non_factual_clause(clause: str) -> bool:
+    return bool(
+        _INCIDENTAL_ACK.match(clause)
+        or _RELIEF_CLOSER.match(clause)
+        or _PRAISE_CLOSER.match(clause)
+        or _FAREWELL_CLOSER.match(clause)
+    )
+
+
+def _sentence_is_non_factual(sentence: str) -> bool:
+    if _is_non_factual_clause(sentence):
+        return True
+    for match in _CLAUSE_JOINER.finditer(sentence):
+        left = sentence[: match.start()].strip(" ,-\u2014")
+        right = sentence[match.end() :].strip(" ,-\u2014")
+        if left and right and _is_non_factual_clause(left) and _is_non_factual_clause(right):
+            return True
+    return False
+
+
+def is_non_factual_chatter(text: str) -> bool:
+    """Fail-closed check: True only when ``text`` is purely social closing/courtesy chatter."""
+    clean = _normalize_comment(text)
+    if not clean:
+        return True
+    if len(clean) > MAX_NON_FACTUAL_CHARS or _CAVEAT_OR_CONTRADICTION.search(clean):
         return False
-    return bool(_MATERIAL_OUTCOME.search(clean))
+    sentences = [part.strip(" ,-\u2014") for part in _SENTENCE_SPLIT.split(clean)]
+    sentences = [part for part in sentences if part]
+    if not sentences or len(sentences) > MAX_NON_FACTUAL_SENTENCES:
+        return False
+    return all(_sentence_is_non_factual(sentence) for sentence in sentences)
+
+
+def materially_changes_outcome(text: str) -> bool:
+    """Fail-closed check: True whenever a post-completion comment is not ignorable chatter."""
+    clean = _normalize_comment(text)
+    if not clean:
+        return False
+    return not is_non_factual_chatter(clean)
 
 
 def looks_like_tool_payload(text: str) -> bool:
@@ -138,7 +227,7 @@ def is_story_event(event: GatedEvent) -> bool:
     if event.kind in MACHINERY_KINDS or event.kind not in STORY_KINDS:
         return False
     text = event_text(event)
-    if event.kind == KIND_TASK_COMMENT and is_incidental_acknowledgement(text):
+    if event.kind == KIND_TASK_COMMENT and is_non_factual_chatter(text):
         return False
     return not looks_like_tool_payload(text)
 
@@ -263,7 +352,7 @@ def _key_turns(events: Sequence[GatedEvent], *, limit: int = MAX_TURNS) -> tuple
         for event in events
         if is_story_event(event)
         for text in (event_text(event),)
-        if len(text) >= 12 and not is_incidental_acknowledgement(text)
+        if len(text) >= 12 and not is_non_factual_chatter(text)
     ]
     if not candidates:
         return ()

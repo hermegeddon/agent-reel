@@ -502,6 +502,32 @@ def _existing_episode_numbers(data_dir: Path) -> set[int]:
     return numbers
 
 
+def _iter_episode_ir_files(data_dir: Path) -> list[Path]:
+    """Return sorted ``script-ir.json`` and ``script-ir-<N>.json`` files in ``data_dir``."""
+    if not data_dir.is_dir():
+        return []
+    return sorted(
+        path
+        for path in data_dir.iterdir()
+        if path.is_file()
+        and (path.name == "script-ir.json" or _SCRIPT_IR_NUM_RE.fullmatch(path.name))
+    )
+
+
+def _read_json_mapping(path: Path, data_dir: Path, label: str) -> Mapping[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CastConfigError(
+            f"existing {label} {path.name} in {data_dir} cannot be verified; use a fresh --data-dir"
+        ) from exc
+    if not isinstance(raw, Mapping):
+        raise CastConfigError(
+            f"existing {label} {path.name} in {data_dir} is malformed; use a fresh --data-dir"
+        )
+    return raw
+
+
 def _verify_cast_directory_isolation(data_dir: Path, series_id: str) -> None:
     """Refuse mixing distinct series or uncasted chapters in the same ``--data-dir``."""
     if not data_dir.is_dir():
@@ -526,17 +552,9 @@ def _verify_cast_directory_isolation(data_dir: Path, series_id: str) -> None:
                 f"directory {data_dir} already belongs to series {other_id!r}; "
                 f"use a fresh --data-dir for series {series_id!r} so existing episodes are preserved"
             )
-    for path in sorted(data_dir.iterdir()):
-        match = _SCRIPT_IR_NUM_RE.fullmatch(path.name)
-        if not match or not path.is_file():
-            continue
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise CastConfigError(
-                f"existing episode file {path.name} in {data_dir} cannot be verified; use a fresh --data-dir"
-            ) from exc
-        binding = raw.get("cast_binding") if isinstance(raw, Mapping) else None
+    for path in _iter_episode_ir_files(data_dir):
+        raw = _read_json_mapping(path, data_dir, "episode file")
+        binding = raw.get("cast_binding")
         if not isinstance(binding, Mapping):
             raise CastConfigError(
                 f"directory {data_dir} already holds uncasted episode {path.name}; "
@@ -547,6 +565,31 @@ def _verify_cast_directory_isolation(data_dir: Path, series_id: str) -> None:
             raise CastConfigError(
                 f"directory {data_dir} already holds {path.name} for series {found_id!r}; "
                 f"use a fresh --data-dir for series {series_id!r}"
+            )
+
+
+def _verify_uncasted_directory_isolation(data_dir: Path) -> None:
+    """Refuse running without ``--cast-config`` in a directory that already holds a cast series."""
+    if not data_dir.is_dir():
+        return
+    for ledger_path in sorted(data_dir.glob("series-*.json")):
+        raw = _read_json_mapping(ledger_path, data_dir, "series ledger")
+        other = load_series(ledger_path)
+        if other.chapters or other.series_id or other.cast_digest or other.cast_roles or raw.get("cast_digest"):
+            other_id = other.series_id or ledger_path.stem.removeprefix("series-")
+            raise CastConfigError(
+                f"directory {data_dir} already belongs to cast-configured series {other_id!r} "
+                f"({ledger_path.name}); pass --cast-config or use a fresh --data-dir so existing episodes are preserved"
+            )
+    for path in _iter_episode_ir_files(data_dir):
+        raw = _read_json_mapping(path, data_dir, "episode file")
+        binding = raw.get("cast_binding")
+        if binding is not None:
+            found_id = str(binding.get("series_id") or "") if isinstance(binding, Mapping) else ""
+            detail = f" for series {found_id!r}" if found_id else ""
+            raise CastConfigError(
+                f"directory {data_dir} already holds cast-configured episode {path.name}{detail}; "
+                "pass --cast-config or use a fresh --data-dir so existing episodes are preserved"
             )
 
 
@@ -561,6 +604,7 @@ def validate_cast_setup(
 ) -> tuple[SeriesCastConfig | None, dict[str, Any]]:
     """Validate opt-in cast config, kits, display names, and series ledger before any model call."""
     if cast_config is None:
+        _verify_uncasted_directory_isolation(data_dir)
         return None, {}
     if redactor is None:
         rule_set = list(rules_from_snapshot())
@@ -741,13 +785,13 @@ def run_pipeline(
 ) -> PipelineResult:
     result = PipelineResult()
     started = time.time()
-    config.data_dir.mkdir(parents=True, exist_ok=True)
 
     rule_set = list(rules_from_snapshot())
     if getattr(config, "privacy", "private") == "public":
         rule_set.extend(public_rules())
     redactor = DeterministicRedactor(rule_set)
     cast_cfg, loaded_kits = _resolve_cast_setup(config, redactor)
+    config.data_dir.mkdir(parents=True, exist_ok=True)
     effective_hero = cast_cfg.owner.name if cast_cfg is not None else config.hero
 
     own_source = source is None

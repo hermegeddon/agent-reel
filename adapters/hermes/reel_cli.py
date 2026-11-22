@@ -297,23 +297,23 @@ def reel_command(args: argparse.Namespace) -> int:
     cast_config_arg: Path | None = Path(cast_config_raw).expanduser() if cast_config_raw else None
     builtin_kits_dir = Path(__file__).resolve().parents[2] / "kits"
 
-    resolved_assets_dir = assets_dir_arg
-    if cast_config_arg is not None:
-        from adapters.hermes.pipeline import validate_cast_setup
-        from canon.series_cast import CastConfigError
+    from adapters.hermes.pipeline import validate_cast_setup
+    from canon.series_cast import CastConfigError
 
-        try:
-            cast_cfg, _kits = validate_cast_setup(
-                cast_config_arg,
-                data_dir=data_dir,
-                assets_dir=assets_dir_arg,
-                builtin_kits_dir=builtin_kits_dir,
-            )
-        except CastConfigError as exc:
-            print(f"invalid cast config: {exc}")
-            return 2
-        if resolved_assets_dir is None and cast_cfg is not None:
-            resolved_assets_dir = cast_cfg.assets_dir or data_dir
+    resolved_assets_dir = assets_dir_arg
+    try:
+        cast_cfg, _kits = validate_cast_setup(
+            cast_config_arg,
+            data_dir=data_dir,
+            assets_dir=assets_dir_arg,
+            builtin_kits_dir=builtin_kits_dir,
+        )
+    except CastConfigError as exc:
+        prefix = "invalid cast config" if cast_config_arg is not None else "cast directory error"
+        print(f"{prefix}: {exc}")
+        return 2
+    if resolved_assets_dir is None and cast_cfg is not None:
+        resolved_assets_dir = cast_cfg.assets_dir or data_dir
 
     # V4: a chapter needs about twice the writer calls of a strip per story tried.
     writer = PluginLLMClient(llm, max_calls=300 if getattr(args, "format", "strip") == "chapter" else 150)

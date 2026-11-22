@@ -751,3 +751,243 @@ def test_adding_costar_preserves_chapter_one_renderability(tmp_path, monkeypatch
     m2 = json.loads((out2 / "render-manifest.json").read_text(encoding="utf-8"))
     assert all(req["bindings"].get("Kensei") == "kensei" and "Cinder" not in req["bindings"] for req in m1["requests"])
     assert any(req["bindings"].get("Cinder") == "placeholder-claude" for req in m2["requests"])
+
+
+def _seed_finished_kanban_home(
+    home: Path,
+    *,
+    task_id: str,
+    result_text: str,
+    reviewer_profile: str,
+    trailing_comment: str,
+) -> None:
+    kdb = home / "kanban.db"
+    kdb.parent.mkdir(parents=True, exist_ok=True)
+    kconn = sqlite3.connect(kdb)
+    kconn.execute(
+        "CREATE TABLE IF NOT EXISTS tasks ("
+        "id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT, status TEXT, "
+        "priority INTEGER, created_by TEXT, created_at REAL, started_at REAL, completed_at REAL, "
+        "tenant TEXT, project_id TEXT, result TEXT)"
+    )
+    kconn.execute(
+        "CREATE TABLE IF NOT EXISTS task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, "
+        "kind TEXT, payload TEXT, created_at REAL)"
+    )
+    kconn.execute(
+        "CREATE TABLE IF NOT EXISTS task_runs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, profile TEXT, step_key TEXT, "
+        "status TEXT, started_at REAL, ended_at REAL, outcome TEXT, summary TEXT, error TEXT)"
+    )
+    kconn.execute(
+        "CREATE TABLE IF NOT EXISTS task_comments ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, author TEXT, body TEXT, created_at REAL)"
+    )
+    kconn.execute(
+        "INSERT INTO tasks (id, title, body, assignee, status, priority, created_by, created_at, started_at, completed_at, result) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            task_id,
+            "Stabilize queue lock guard",
+            "Stabilize queue lock guard across retries.",
+            "default",
+            "completed",
+            1,
+            "owner",
+            NOW - 5000,
+            NOW - 4800,
+            NOW - 3800,
+            result_text,
+        ),
+    )
+    for msg, ts_val in (
+        ("Decided to audit the stalled queue lock timeout.", NOW - 4650),
+        ("Found a blocked lock timeout across worker retries.", NOW - 4550),
+        ("Diagnosed flaky retry failure inside queue worker.", NOW - 4450),
+        ("Approved adding clean retry guard and timeout cap.", NOW - 4350),
+    ):
+        kconn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+            (task_id, "default", msg, ts_val),
+        )
+    kconn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+        (task_id, reviewer_profile, trailing_comment, NOW - 3750),
+    )
+    kconn.commit()
+    kconn.close()
+
+
+def test_omitting_cast_config_refuses_to_overwrite_cast_plan_e2e(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "hermes_home"
+    _add_hermes_session(
+        home / "state.db",
+        session_id="sess-guard",
+        profile="default",
+        topic="queue",
+        base_ts=NOW - 7200,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("REEL_ALLOW_CUSTOM_STATE", "1")
+
+    assets = tmp_path / "assets"
+    _make_kit(assets, "maren-lead", "Maren", role="hero")
+    cast_file = tmp_path / "cast.json"
+    cast_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "pilot-guard",
+                "assets_dir": str(assets),
+                "owner": {"name": "Maren", "kit": "maren-lead"},
+                "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan_dir = tmp_path / "plan"
+    harness_1 = _FakeE2EHarness()
+    rc_1 = _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness_1,
+        argv=["plan", "--dry-run", "--data-dir", str(plan_dir), "--cast-config", str(cast_file), "--episodes", "1"],
+        default_dir=tmp_path / "default_data",
+    )
+    assert rc_1 == 0
+    assert harness_1.llm_calls
+    capsys.readouterr()
+
+    ir1_path = plan_dir / "script-ir-1.json"
+    ir_path = plan_dir / "script-ir.json"
+    ledger_path = plan_dir / "series-pilot-guard.json"
+    ir1_before = ir1_path.read_bytes()
+    ir_before = ir_path.read_bytes()
+    ledger_before = ledger_path.read_bytes()
+
+    harness_2 = _FakeE2EHarness()
+    rc_2 = _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness_2,
+        argv=["plan", "--dry-run", "--data-dir", str(plan_dir), "--episodes", "1"],
+        default_dir=tmp_path / "default_data",
+    )
+    out_2 = capsys.readouterr().out
+    assert rc_2 == 2
+    assert harness_2.llm_calls == []
+    assert "cast directory error" in out_2
+    assert ir1_path.read_bytes() == ir1_before
+    assert ir_path.read_bytes() == ir_before
+    assert ledger_path.read_bytes() == ledger_before
+    assert json.loads(ir1_before.decode("utf-8"))["cast_binding"]["series_id"] == "pilot-guard"
+
+
+def test_post_completion_celebratory_relief_vs_contradiction_e2e(tmp_path, monkeypatch, capsys):
+    assets = tmp_path / "assets"
+    _make_kit(assets, "maren-lead", "Maren", role="hero")
+    reviewer = "secret-reviewer"
+
+    # Case A: Celebratory relief + thanks adds no new fact -> 1 episode, preserves recorded result.
+    home_a = tmp_path / "home_a"
+    _seed_finished_kanban_home(
+        home_a,
+        task_id="t-relief",
+        result_text="Fixed the queue lock cleanly.",
+        reviewer_profile=reviewer,
+        trailing_comment="Glad the bug is behind us. Thanks, everyone!",
+    )
+    cast_a = tmp_path / "cast_a.json"
+    cast_a.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "relief-case",
+                "assets_dir": str(assets),
+                "owner": {"name": "Maren", "kit": "maren-lead"},
+                "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_a = tmp_path / "plan_a"
+    harness_a = _FakeE2EHarness()
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    monkeypatch.setenv("REEL_ALLOW_CUSTOM_STATE", "1")
+    rc_a = _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness_a,
+        argv=[
+            "plan", "--dry-run",
+            "--data-dir", str(plan_a),
+            "--cast-config", str(cast_a),
+            "--all-profiles",
+            "--episodes", "1",
+        ],
+        default_dir=tmp_path / "default_a",
+    )
+    out_a = capsys.readouterr().out
+    assert rc_a == 0, out_a
+    assert harness_a.llm_calls
+    assert "cast diagnostics" not in out_a
+    ir_a = json.loads((plan_a / "script-ir-1.json").read_text(encoding="utf-8"))
+    assert ir_a["cast_binding"]["characters"] == {
+        "Maren": {"kit": "maren-lead", "lead": True},
+        "Kensei": {"kit": "kensei", "lead": False},
+    }
+    assert "Fixed the queue lock cleanly" in json.dumps(harness_a.llm_calls)
+    assert "behind us" not in json.dumps(harness_a.llm_calls)
+    assert "behind us" not in (plan_a / "episode-1-script.md").read_text(encoding="utf-8")
+    for path in sorted(plan_a.rglob("*")):
+        if path.is_file():
+            assert reviewer not in path.read_text(encoding="utf-8", errors="ignore"), path
+
+    # Case B: Post-completion contradiction -> stops before writing (0 writer calls), flags missing mapping locally.
+    home_b = tmp_path / "home_b"
+    _seed_finished_kanban_home(
+        home_b,
+        task_id="t-contradict",
+        result_text="Fixed the queue lock cleanly.",
+        reviewer_profile=reviewer,
+        trailing_comment="The queue is frozen again.",
+    )
+    cast_b = tmp_path / "cast_b.json"
+    cast_b.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "contradict-case",
+                "assets_dir": str(assets),
+                "owner": {"name": "Maren", "kit": "maren-lead"},
+                "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_b = tmp_path / "plan_b"
+    harness_b = _FakeE2EHarness()
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    rc_b = _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness_b,
+        argv=[
+            "plan", "--dry-run",
+            "--data-dir", str(plan_b),
+            "--cast-config", str(cast_b),
+            "--all-profiles",
+            "--episodes", "1",
+        ],
+        default_dir=tmp_path / "default_b",
+    )
+    out_b = capsys.readouterr().out
+    assert rc_b == 1
+    assert harness_b.llm_calls == []
+    assert not (plan_b / "script-ir-1.json").exists()
+    assert not (plan_b / "script-ir.json").exists()
+    assert f"hermes:{reviewer}" in out_b
+    metrics_b = json.loads((plan_b / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics_b["episodes"] == []
+    assert any("unmapped participating role (unmapped-role-" in row["reason"] for row in metrics_b["skipped_stories"])
+    for path in sorted(plan_b.rglob("*")):
+        if path.is_file():
+            assert reviewer not in path.read_text(encoding="utf-8", errors="ignore"), path
