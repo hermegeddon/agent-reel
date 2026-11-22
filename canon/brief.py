@@ -202,33 +202,45 @@ def is_non_factual_chatter(text: str) -> bool:
     return all(_sentence_is_non_factual(sentence) for sentence in sentences)
 
 
-def materially_changes_outcome(text: str) -> bool:
-    """Fail-closed check: True unless a post-completion comment is ignorable social chatter
-    or a non-contradictory bookkeeping follow-up (e.g. filing meeting notes)."""
-    clean = _normalize_comment(text)
-    if not clean:
-        return False
-    return not is_non_factual_chatter(clean) and not _is_admin_followup(clean)
-
-
 def _has_contradiction_signal(text: str) -> bool:
     """True when text contains an explicit contradiction, caveat, blocker, or failure cue."""
     clean = _normalize_comment(text)
     return bool(clean and _CAVEAT_OR_CONTRADICTION.search(clean))
 
 
-_ADMIN_FOLLOWUP = re.compile(
-    r"^\s*(?:"
-    r"(?:i\s+|we\s+)?"
-    r"(?:added|logged|noted|recorded|posted|shared|copied|filed|linked|updated|archived|put|saved|wrote|captured|summari[sz]ed)\b"
-    r".{0,100}\b"
-    r"(?:meeting\s+notes?|stand[- ]?up(?:\s+notes?)?|notes?|changelog|release\s+notes?|"
-    r"runbook|wiki|docs?|documentation|retro(?:spective)?|minutes)\b"
-    r"|"
-    r"(?:the\s+)?(?:meeting\s+notes?|stand[- ]?up(?:\s+notes?)?|notes?|changelog|"
-    r"release\s+notes?|runbook|wiki|docs?|documentation|minutes)\s+"
-    r"(?:were\s+|are\s+|have\s+been\s+)?(?:updated|synced|refreshed|archived|linked|filed|posted|saved|recorded|logged|shared)\b"
-    r")[^?!]*[.!\s]*$",
+_ADMIN_VERB = (
+    r"(?:added|logged|noted|recorded|posted|shared|copied|filed|linked|"
+    r"updated|archived|put|saved|wrote|captured|summari[sz]ed)"
+)
+_ADMIN_DOC = (
+    r"(?:meeting\s+notes?|stand[- ]?up(?:\s+notes?)?|notes?|changelog|"
+    r"release\s+notes?|runbook|wiki|docs?|documentation|retro(?:spective)?|minutes)"
+)
+_ADMIN_MOD_TOKEN = (
+    r"(?!and\b|or\b|because\b|while\b|when\b|where\b|that\b|which\b|who\b|"
+    r"after\b|before\b|since\b|so\b|then\b|if\b|as\b)[a-z0-9][a-z0-9'/-]*"
+)
+_ADMIN_DOC_PHRASE = rf"(?:(?:{_ADMIN_MOD_TOKEN}\s+){{0,3}}{_ADMIN_DOC})"
+_ADMIN_PREP_PHRASE = rf"(?:(?:in|into|on|under|for)\s+(?:{_ADMIN_MOD_TOKEN}\s+){{0,4}}{_ADMIN_MOD_TOKEN})"
+_ADMIN_SUMMARY_REF = (
+    r"(?:"
+    r"this|that|it|"
+    r"(?:a|the|this|that)\s+"
+    rf"(?:{_ADMIN_MOD_TOKEN}\s+){{0,3}}"
+    r"(?:summary|recap|update|entry|note|notes|link|bullet|line|resolution|outcome|result)"
+    r")"
+)
+_ADMIN_PASSIVE_VERB = (
+    r"(?:updated|synced|refreshed|archived|linked|filed|posted|saved|recorded|logged|shared)"
+)
+_ADMIN_SENTENCE = re.compile(
+    rf"^\s*(?:"
+    rf"(?:(?:i|we)\s+)?{_ADMIN_VERB}\s+{_ADMIN_DOC_PHRASE}(?:\s+{_ADMIN_PREP_PHRASE})?"
+    rf"|"
+    rf"(?:(?:i|we)\s+)?{_ADMIN_VERB}\s+{_ADMIN_SUMMARY_REF}\s+(?:to|in|into|on|under|for)\s+{_ADMIN_DOC_PHRASE}(?:\s+{_ADMIN_PREP_PHRASE})?"
+    rf"|"
+    rf"{_ADMIN_DOC_PHRASE}\s+(?:(?:were|was|are|is|have\s+been|has\s+been)\s+)?{_ADMIN_PASSIVE_VERB}(?:\s+{_ADMIN_PREP_PHRASE})?"
+    rf")\s*$",
     re.IGNORECASE,
 )
 
@@ -238,17 +250,35 @@ _ADMIN_DEFECT_GUARD = re.compile(
 )
 
 
-def _is_admin_followup(text: str) -> bool:
-    """True for non-contradictory post-completion bookkeeping notes (e.g. meeting notes)."""
+def _is_admin_sentence(sentence: str) -> bool:
+    return bool(
+        sentence
+        and not _ADMIN_DEFECT_GUARD.search(sentence)
+        and _ADMIN_SENTENCE.match(sentence)
+    )
+
+
+def _is_non_material_followup(text: str) -> bool:
+    """True only when every sentence in ``text`` is pure social chatter or a plain bookkeeping note."""
     clean = _normalize_comment(text)
-    if (
-        not clean
-        or len(clean) > MAX_NON_FACTUAL_CHARS
-        or _has_contradiction_signal(clean)
-        or _ADMIN_DEFECT_GUARD.search(clean)
-    ):
+    if not clean:
+        return True
+    if len(clean) > MAX_NON_FACTUAL_CHARS or _has_contradiction_signal(clean):
         return False
-    return bool(_ADMIN_FOLLOWUP.match(clean))
+    sentences = [part.strip(" ,-\u2014") for part in _SENTENCE_SPLIT.split(clean)]
+    sentences = [part for part in sentences if part]
+    if not sentences or len(sentences) > MAX_NON_FACTUAL_SENTENCES:
+        return False
+    return all(_sentence_is_non_factual(sentence) or _is_admin_sentence(sentence) for sentence in sentences)
+
+
+def materially_changes_outcome(text: str) -> bool:
+    """Fail-closed check: True unless every part of a post-completion comment is ignorable
+    social chatter or a non-contradictory bookkeeping note (e.g. filing meeting notes)."""
+    clean = _normalize_comment(text)
+    if not clean:
+        return False
+    return not _is_non_material_followup(clean)
 
 
 def looks_like_tool_payload(text: str) -> bool:

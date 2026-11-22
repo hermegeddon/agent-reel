@@ -496,3 +496,74 @@ def test_clean_task_meeting_notes_non_material_for_mapped_and_unmapped():
         assert brief.outcome_event_id == base_rows[2].id
         assert brief.post_completion_event_ids == ()
         assert all(turn.event_id != note_ev.id for turn in brief.turns)
+
+
+def test_mixed_admin_and_factual_comment_is_material_while_filing_alone_is_exempt():
+    assert not materially_changes_outcome("I filed the meeting notes.")
+    assert not materially_changes_outcome("I filed the meeting notes. Thanks, everyone!")
+
+    for mixed in (
+        "I filed the meeting notes. The queue processed every invoice twice.",
+        "The queue processed every invoice twice. I filed the meeting notes.",
+        "I filed the meeting notes; the queue processed every invoice twice.",
+        "I filed the meeting notes and the queue processed every invoice twice.",
+        "I filed the meeting notes: the queue processed every invoice twice.",
+        "Noted that the queue processed every invoice twice in the meeting notes.",
+        "I filed the meeting notes. Customers saw extra charges overnight.",
+    ):
+        assert materially_changes_outcome(mixed), mixed
+
+    base_rows = [
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_CREATED, ts=1.0, profile="default", actor="owner",
+                subject="t5", payload={"task_id": "t5", "title": "Fix queue lock guard cleanly"},
+                store="kanban", table="tasks", pk="t5-c",
+            ),
+            {"task_id": "t5", "title": "Fix queue lock guard cleanly"},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=2.0, profile="default", actor="Kensei",
+                subject="t5", payload={"task_id": "t5", "text": "Audited lock timeout across worker pool."},
+                store="kanban", table="task_comments", pk="t5-k1",
+            ),
+            {"task_id": "t5", "text": "Audited lock timeout across worker pool."},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_FINISHED, ts=3.0, profile="default", actor="Kensei",
+                subject="t5", payload={"task_id": "t5", "text": "Fixed the queue lock cleanly."},
+                store="kanban", table="tasks", pk="t5-f",
+            ),
+            {"task_id": "t5", "text": "Fixed the queue lock cleanly."},
+        ),
+    ]
+    unmapped = "unmapped-role-deadbeef"
+    pure_note = seal(
+        build_event(
+            source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile=unmapped, actor=unmapped,
+            subject="t5", payload={"task_id": "t5", "text": "I filed the meeting notes."},
+            store="kanban", table="task_comments", pk="t5-pure-note",
+        ),
+        {"task_id": "t5", "text": "I filed the meeting notes."},
+    )
+    clean_brief = build_brief("t5", "task", base_rows + [pure_note])
+    assert clean_brief.outcome == "Fixed the queue lock cleanly."
+    assert clean_brief.post_completion_event_ids == ()
+    assert all(turn.event_id != pure_note.id for turn in clean_brief.turns)
+
+    mixed_text = "I filed the meeting notes. The queue processed every invoice twice."
+    mixed_ev = seal(
+        build_event(
+            source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile=unmapped, actor=unmapped,
+            subject="t5", payload={"task_id": "t5", "text": mixed_text},
+            store="kanban", table="task_comments", pk="t5-mixed-note",
+        ),
+        {"task_id": "t5", "text": mixed_text},
+    )
+    mixed_brief = build_brief("t5", "task", base_rows + [mixed_ev])
+    assert mixed_brief.outcome == mixed_text
+    assert mixed_brief.outcome_event_id == mixed_ev.id
+    assert mixed_ev.id in mixed_brief.post_completion_event_ids
+    assert any(turn.event_id == mixed_ev.id for turn in mixed_brief.turns)

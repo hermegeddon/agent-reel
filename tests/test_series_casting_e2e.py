@@ -1237,3 +1237,114 @@ def test_chapter_with_thirteen_required_turns_finishes_planning_e2e(tmp_path, mo
     assert len(turn_fact_objects) >= 13
     for _, msg, _ in required_comments:
         assert any(msg[:30] in obj for obj in turn_fact_objects), msg
+
+
+def test_mixed_meeting_notes_and_factual_claim_blocks_while_filing_alone_passes_e2e(
+    tmp_path, monkeypatch, capsys
+):
+    assets = tmp_path / "assets"
+    _make_kit(assets, "maren-lead", "Maren", role="hero")
+    unmapped_author = "secret-notetaker"
+
+    # Case 1: filing sentence alone is exempt -> produces 1 episode cleanly.
+    home_ok = tmp_path / "home_filing_alone"
+    _seed_finished_kanban_home(
+        home_ok,
+        task_id="t-filing-ok",
+        result_text="Fixed the queue lock cleanly.",
+        reviewer_profile=unmapped_author,
+        trailing_comment="I filed the meeting notes.",
+    )
+    cast_ok = tmp_path / "cast_filing_ok.json"
+    cast_ok.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "filing-alone-ok",
+                "assets_dir": str(assets),
+                "owner": {"name": "Maren", "kit": "maren-lead"},
+                "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_ok = tmp_path / "plan_filing_ok"
+    harness_ok = _FakeE2EHarness()
+    monkeypatch.setenv("HERMES_HOME", str(home_ok))
+    monkeypatch.setenv("REEL_ALLOW_CUSTOM_STATE", "1")
+    rc_ok = _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness_ok,
+        argv=[
+            "plan", "--dry-run",
+            "--data-dir", str(plan_ok),
+            "--cast-config", str(cast_ok),
+            "--all-profiles",
+            "--episodes", "1",
+        ],
+        default_dir=tmp_path / "default_filing_ok",
+    )
+    out_ok = capsys.readouterr().out
+    assert rc_ok == 0, out_ok
+    assert harness_ok.llm_calls
+    ir_ok = json.loads((plan_ok / "script-ir-1.json").read_text(encoding="utf-8"))
+    assert ir_ok["cast_binding"]["characters"] == {
+        "Maren": {"kit": "maren-lead", "lead": True},
+        "Kensei": {"kit": "kensei", "lead": False},
+    }
+    assert "Fixed the queue lock cleanly" in json.dumps(harness_ok.llm_calls)
+    assert "meeting notes" not in json.dumps(harness_ok.llm_calls).lower()
+    assert "meeting notes" not in (plan_ok / "episode-1-script.md").read_text(encoding="utf-8").lower()
+    for path in sorted(plan_ok.rglob("*")):
+        if path.is_file():
+            assert unmapped_author not in path.read_text(encoding="utf-8", errors="ignore"), path
+
+    # Case 2: mixed bookkeeping + factual claim -> blocks before the first writer call.
+    home_bad = tmp_path / "home_mixed_claim"
+    _seed_finished_kanban_home(
+        home_bad,
+        task_id="t-mixed-block",
+        result_text="Fixed the queue lock cleanly.",
+        reviewer_profile=unmapped_author,
+        trailing_comment="I filed the meeting notes. The queue processed every invoice twice.",
+    )
+    cast_bad = tmp_path / "cast_mixed_block.json"
+    cast_bad.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "mixed-notes-block",
+                "assets_dir": str(assets),
+                "owner": {"name": "Maren", "kit": "maren-lead"},
+                "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_bad = tmp_path / "plan_mixed_block"
+    harness_bad = _FakeE2EHarness()
+    monkeypatch.setenv("HERMES_HOME", str(home_bad))
+    rc_bad = _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness_bad,
+        argv=[
+            "plan", "--dry-run",
+            "--data-dir", str(plan_bad),
+            "--cast-config", str(cast_bad),
+            "--all-profiles",
+            "--episodes", "1",
+        ],
+        default_dir=tmp_path / "default_mixed_block",
+    )
+    out_bad = capsys.readouterr().out
+    assert rc_bad == 1, out_bad
+    assert harness_bad.llm_calls == []
+    assert not (plan_bad / "script-ir-1.json").exists()
+    assert not (plan_bad / "script-ir.json").exists()
+    assert f"hermes:{unmapped_author}" in out_bad
+    metrics_bad = json.loads((plan_bad / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics_bad["episodes"] == []
+    assert any("unmapped participating role (unmapped-role-" in row["reason"] for row in metrics_bad["skipped_stories"])
+    for path in sorted(plan_bad.rglob("*")):
+        if path.is_file():
+            assert unmapped_author not in path.read_text(encoding="utf-8", errors="ignore"), path
