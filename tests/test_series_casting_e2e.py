@@ -760,6 +760,7 @@ def _seed_finished_kanban_home(
     result_text: str,
     reviewer_profile: str,
     trailing_comment: str,
+    follow_up_comments: tuple[tuple[str, str, float], ...] = (),
 ) -> None:
     kdb = home / "kanban.db"
     kdb.parent.mkdir(parents=True, exist_ok=True)
@@ -815,6 +816,11 @@ def _seed_finished_kanban_home(
         "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
         (task_id, reviewer_profile, trailing_comment, NOW - 3750),
     )
+    for author, body, ts_val in follow_up_comments:
+        kconn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+            (task_id, author, body, ts_val),
+        )
     kconn.commit()
     kconn.close()
 
@@ -989,5 +995,115 @@ def test_post_completion_celebratory_relief_vs_contradiction_e2e(tmp_path, monke
     assert metrics_b["episodes"] == []
     assert any("unmapped participating role (unmapped-role-" in row["reason"] for row in metrics_b["skipped_stories"])
     for path in sorted(plan_b.rglob("*")):
+        if path.is_file():
+            assert reviewer not in path.read_text(encoding="utf-8", errors="ignore"), path
+
+
+def test_later_mapped_meeting_notes_leaves_unmapped_frozen_queue_unresolved_e2e(tmp_path, monkeypatch, capsys):
+    assets = tmp_path / "assets"
+    _make_kit(assets, "maren-lead", "Maren", role="hero")
+    reviewer = "secret-reviewer"
+
+    for label, follow_author, follow_body in (
+        ("default-notes", "default", "Added the queue lock summary to Friday's meeting notes."),
+        ("owner-notes", "owner", "Added the queue lock summary to Friday's meeting notes."),
+        ("default-retry-notes", "default", "Meeting notes updated: review retry checklist next Monday."),
+    ):
+        home = tmp_path / f"home_{label}"
+        _seed_finished_kanban_home(
+            home,
+            task_id=f"t-{label}",
+            result_text="Fixed the queue lock cleanly.",
+            reviewer_profile=reviewer,
+            trailing_comment="The queue is frozen again.",
+            follow_up_comments=((follow_author, follow_body, NOW - 3700),),
+        )
+        cast_cfg = tmp_path / f"cast_{label}.json"
+        cast_cfg.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "series_id": f"unresolved-{label}",
+                    "assets_dir": str(assets),
+                    "owner": {"name": "Maren", "kit": "maren-lead"},
+                    "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan_dir = tmp_path / f"plan_{label}"
+        harness = _FakeE2EHarness()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("REEL_ALLOW_CUSTOM_STATE", "1")
+        rc = _run_plan_and_render_with_harness(
+            monkeypatch,
+            harness,
+            argv=[
+                "plan", "--dry-run",
+                "--data-dir", str(plan_dir),
+                "--cast-config", str(cast_cfg),
+                "--all-profiles",
+                "--episodes", "1",
+            ],
+            default_dir=tmp_path / f"default_{label}",
+        )
+        out = capsys.readouterr().out
+        assert rc == 1, label
+        assert harness.llm_calls == [], label
+        assert not (plan_dir / "script-ir-1.json").exists(), label
+        assert not (plan_dir / "script-ir.json").exists(), label
+        assert f"hermes:{reviewer}" in out, label
+        metrics = json.loads((plan_dir / "metrics.json").read_text(encoding="utf-8"))
+        assert metrics["episodes"] == [], label
+        assert any("unmapped participating role (unmapped-role-" in row["reason"] for row in metrics["skipped_stories"]), label
+        for path in sorted(plan_dir.rglob("*")):
+            if path.is_file():
+                assert reviewer not in path.read_text(encoding="utf-8", errors="ignore"), path
+
+    # Control: celebratory relief before a mapped meeting-notes follow-up still produces 1 episode cleanly.
+    home_ok = tmp_path / "home_relief_notes"
+    _seed_finished_kanban_home(
+        home_ok,
+        task_id="t-relief-notes",
+        result_text="Fixed the queue lock cleanly.",
+        reviewer_profile=reviewer,
+        trailing_comment="Glad the bug is behind us. Thanks, everyone!",
+        follow_up_comments=(("default", "Added the queue lock summary to Friday's meeting notes.", NOW - 3700),),
+    )
+    cast_ok = tmp_path / "cast_relief_notes.json"
+    cast_ok.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "relief-notes-ok",
+                "assets_dir": str(assets),
+                "owner": {"name": "Maren", "kit": "maren-lead"},
+                "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_ok = tmp_path / "plan_relief_notes"
+    harness_ok = _FakeE2EHarness()
+    monkeypatch.setenv("HERMES_HOME", str(home_ok))
+    rc_ok = _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness_ok,
+        argv=[
+            "plan", "--dry-run",
+            "--data-dir", str(plan_ok),
+            "--cast-config", str(cast_ok),
+            "--all-profiles",
+            "--episodes", "1",
+        ],
+        default_dir=tmp_path / "default_relief_notes",
+    )
+    out_ok = capsys.readouterr().out
+    assert rc_ok == 0, out_ok
+    assert harness_ok.llm_calls
+    assert "cast diagnostics" not in out_ok
+    assert (plan_ok / "script-ir-1.json").is_file()
+    assert "behind us" not in json.dumps(harness_ok.llm_calls)
+    for path in sorted(plan_ok.rglob("*")):
         if path.is_file():
             assert reviewer not in path.read_text(encoding="utf-8", errors="ignore"), path

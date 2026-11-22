@@ -210,6 +210,36 @@ def materially_changes_outcome(text: str) -> bool:
     return not is_non_factual_chatter(clean)
 
 
+def _has_contradiction_signal(text: str) -> bool:
+    """True when text contains an explicit contradiction, caveat, blocker, or failure cue."""
+    clean = _normalize_comment(text)
+    return bool(clean and _CAVEAT_OR_CONTRADICTION.search(clean))
+
+
+_ADMIN_FOLLOWUP = re.compile(
+    r"^\s*(?:"
+    r"(?:i\s+|we\s+)?"
+    r"(?:added|logged|noted|recorded|posted|shared|copied|filed|linked|updated|archived|put)\b"
+    r".{0,100}\b"
+    r"(?:meeting\s+notes?|stand[- ]?up(?:\s+notes?)?|notes?|changelog|release\s+notes?|"
+    r"runbook|wiki|docs?|documentation|retro(?:spective)?|minutes)\b"
+    r"|"
+    r"(?:the\s+)?(?:meeting\s+notes?|stand[- ]?up(?:\s+notes?)?|notes?|changelog|"
+    r"release\s+notes?|runbook|wiki|docs?|documentation|minutes)\s+"
+    r"(?:were\s+|are\s+|have\s+been\s+)?(?:updated|synced|refreshed|archived|linked)\b"
+    r")[^?!]*[.!\s]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_admin_followup(text: str) -> bool:
+    """True for non-contradictory post-completion bookkeeping notes (e.g. meeting notes)."""
+    clean = _normalize_comment(text)
+    if not clean or len(clean) > MAX_NON_FACTUAL_CHARS or _has_contradiction_signal(clean):
+        return False
+    return bool(_ADMIN_FOLLOWUP.match(clean))
+
+
 def looks_like_tool_payload(text: str) -> bool:
     """True when a string is a tool payload rather than prose."""
     clean = (text or "").strip()
@@ -267,6 +297,7 @@ class ThreadBrief:
     outcome: str = ""
     goal_event_id: str = ""
     outcome_event_id: str = ""
+    post_completion_event_ids: tuple[str, ...] = ()
     dropped: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
 
@@ -345,7 +376,12 @@ def _spread(candidates: list[tuple[GatedEvent, str]], limit: int) -> list[tuple[
     return [distinct[i] for i in picked]
 
 
-def _key_turns(events: Sequence[GatedEvent], *, limit: int = MAX_TURNS) -> tuple[BriefTurn, ...]:
+def _key_turns(
+    events: Sequence[GatedEvent],
+    *,
+    limit: int = MAX_TURNS,
+    required_ids: Iterable[str] = (),
+) -> tuple[BriefTurn, ...]:
     """Text-bearing events, distinct, spread across the thread, best first."""
     candidates = [
         (event, text)
@@ -356,9 +392,29 @@ def _key_turns(events: Sequence[GatedEvent], *, limit: int = MAX_TURNS) -> tuple
     ]
     if not candidates:
         return ()
+    required = {eid for eid in required_ids if eid}
     if limit > MAX_TURNS:
         # A chapter covers the whole thread, beginning to end, not its first exchanges.
-        chosen_long = _spread(sorted(candidates, key=lambda pair: pair[0].ts), limit)
+        ordered = sorted(candidates, key=lambda pair: pair[0].ts)
+        if not required:
+            chosen_long = _spread(ordered, limit)
+        else:
+            seen_long: set[str] = set()
+            pinned: list[tuple[GatedEvent, str]] = []
+            rest: list[tuple[GatedEvent, str]] = []
+            for event, text in ordered:
+                lower = text.lower()
+                if lower in seen_long:
+                    continue
+                seen_long.add(lower)
+                (pinned if event.id in required else rest).append((event, text))
+            if len(pinned) >= limit:
+                chosen_long = pinned[-limit:]
+            else:
+                chosen_long = sorted(
+                    pinned + _spread(rest, limit - len(pinned)),
+                    key=lambda pair: pair[0].ts,
+                )
         return tuple(
             BriefTurn(event_id=event.id, actor=event.actor or event.profile or "", text=text)
             for event, text in chosen_long
@@ -368,20 +424,36 @@ def _key_turns(events: Sequence[GatedEvent], *, limit: int = MAX_TURNS) -> tuple
     seen_text: set[str] = set()
     seen_actor: set[str] = set()
 
+    # Keep all post-completion material reports visible so later comments cannot crowd them out.
+    if required:
+        req_pairs: list[tuple[GatedEvent, str]] = []
+        req_seen: set[str] = set()
+        for event, text in candidates:
+            if event.id in required and text.lower() not in req_seen:
+                req_seen.add(text.lower())
+                req_pairs.append((event, text))
+        for event, text in req_pairs[-limit:]:
+            chosen.append((event, text))
+            seen_text.add(text.lower())
+            actor = event.actor or event.profile or ""
+            if actor and not is_unmapped_label(actor):
+                seen_actor.add(actor)
+
     # Prefer unseen mapped actors and unseen text; do not boost unmapped bystanders ahead of mapped turns.
-    for event, text in candidates:
-        actor = event.actor or event.profile or ""
-        if text.lower() in seen_text:
-            continue
-        if is_unmapped_label(actor):
-            continue
-        if actor and actor in seen_actor and len(chosen) < limit - 1:
-            continue
-        chosen.append((event, text))
-        seen_text.add(text.lower())
-        seen_actor.add(actor)
-        if len(chosen) >= limit:
-            break
+    if len(chosen) < limit:
+        for event, text in candidates:
+            actor = event.actor or event.profile or ""
+            if text.lower() in seen_text:
+                continue
+            if is_unmapped_label(actor):
+                continue
+            if actor and actor in seen_actor and len(chosen) < limit - 1:
+                continue
+            chosen.append((event, text))
+            seen_text.add(text.lower())
+            seen_actor.add(actor)
+            if len(chosen) >= limit:
+                break
     if len(chosen) < limit:
         for event, text in candidates:
             if text.lower() in seen_text:
@@ -457,6 +529,7 @@ def build_brief(
     goal_event_id = ""
     outcome = ""
     outcome_event_id = ""
+    post_completion_event_ids: tuple[str, ...] = ()
     turn_rows: Sequence[GatedEvent] = rows
     if kind == "session":
         user_row = next(
@@ -511,19 +584,28 @@ def build_brief(
             None,
         )
         if recorded_finish is not None:
-            material_later = next(
-                (
-                    row
-                    for row in reversed(rows)
-                    if row.ts >= recorded_finish.ts
-                    and row.id != recorded_finish.id
-                    and row.kind == KIND_TASK_COMMENT
-                    and is_story_event(row)
-                    and materially_changes_outcome(event_text(row))
-                ),
-                None,
-            )
-            finished_row = material_later or recorded_finish
+            material_later_rows = [
+                row
+                for row in rows
+                if row.ts >= recorded_finish.ts
+                and row.id != recorded_finish.id
+                and row.kind == KIND_TASK_COMMENT
+                and is_story_event(row)
+                and materially_changes_outcome(event_text(row))
+            ]
+            post_completion_event_ids = tuple(row.id for row in material_later_rows)
+            contradictions = [
+                row for row in material_later_rows if _has_contradiction_signal(event_text(row))
+            ]
+            non_admin = [
+                row for row in material_later_rows if not _is_admin_followup(event_text(row))
+            ]
+            if contradictions:
+                finished_row = contradictions[-1]
+            elif non_admin:
+                finished_row = non_admin[-1]
+            else:
+                finished_row = recorded_finish
             # Ignore non-material post-completion chatter when picking brief turns too.
             turn_rows = [
                 row
@@ -549,7 +631,7 @@ def build_brief(
             outcome = event_text(finished_row)
             outcome_event_id = finished_row.id
 
-    turns = _key_turns(turn_rows, limit=max_turns)
+    turns = _key_turns(turn_rows, limit=max_turns, required_ids=post_completion_event_ids)
 
     brief = ThreadBrief(
         thread_key=thread_key,
@@ -559,6 +641,7 @@ def build_brief(
         outcome=strip_internal_ids(outcome),
         goal_event_id=goal_event_id,
         outcome_event_id=outcome_event_id,
+        post_completion_event_ids=post_completion_event_ids,
     )
     if gate is None:
         return brief

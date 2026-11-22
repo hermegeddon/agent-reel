@@ -1238,6 +1238,7 @@ def run_pipeline(
                 relied_event_ids = (
                     ({brief.goal_event_id} if brief.goal_event_id else set())
                     | ({brief.outcome_event_id} if brief.outcome_event_id else set())
+                    | set(brief.post_completion_event_ids)
                     | {turn.event_id for turn in brief.turns if turn.event_id}
                     | {eid for beat in panel_beats for eid in beat.event_ids}
                     | {fact.event_id for fact in thread_facts if fact.event_id}

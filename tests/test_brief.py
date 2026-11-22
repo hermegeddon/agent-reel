@@ -239,4 +239,127 @@ def test_incidental_task_comment_after_completion_does_not_become_outcome_or_tur
         blocked_brief = build_brief("t2", "task", base_rows + [blocker_ev])
         assert blocked_brief.outcome == material_comment
         assert blocked_brief.outcome_event_id == blocker_ev.id
+        assert blocker_ev.id in blocked_brief.post_completion_event_ids
         assert any(turn.event_id == blocker_ev.id for turn in blocked_brief.turns)
+
+
+def test_later_meeting_notes_comment_leaves_post_completion_report_unresolved():
+    # Six prior events fill MAX_TURNS=6 before any post-completion comments arrive.
+    base_rows = [
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_CREATED, ts=1.0, profile="default", actor="owner",
+                subject="t3", payload={"task_id": "t3", "title": "Fix queue lock guard cleanly"},
+                store="kanban", table="tasks", pk="t3-c",
+            ),
+            {"task_id": "t3", "title": "Fix queue lock guard cleanly"},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=2.0, profile="default", actor="Kensei",
+                subject="t3", payload={"task_id": "t3", "text": "Audited lock timeout across worker pool."},
+                store="kanban", table="task_comments", pk="t3-k1",
+            ),
+            {"task_id": "t3", "text": "Audited lock timeout across worker pool."},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=3.0, profile="default", actor="Maren",
+                subject="t3", payload={"task_id": "t3", "text": "Traced stale bypass on queue handoff."},
+                store="kanban", table="task_comments", pk="t3-k2",
+            ),
+            {"task_id": "t3", "text": "Traced stale bypass on queue handoff."},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile="default", actor="Kensei",
+                subject="t3", payload={"task_id": "t3", "text": "Patched queue guard threshold limit cleanly."},
+                store="kanban", table="task_comments", pk="t3-k3",
+            ),
+            {"task_id": "t3", "text": "Patched queue guard threshold limit cleanly."},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=5.0, profile="default", actor="Maren",
+                subject="t3", payload={"task_id": "t3", "text": "Confirmed worker suite passed after restart."},
+                store="kanban", table="task_comments", pk="t3-k4",
+            ),
+            {"task_id": "t3", "text": "Confirmed worker suite passed after restart."},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_FINISHED, ts=6.0, profile="default", actor="Kensei",
+                subject="t3", payload={"task_id": "t3", "text": "Fixed the queue lock cleanly."},
+                store="kanban", table="tasks", pk="t3-f",
+            ),
+            {"task_id": "t3", "text": "Fixed the queue lock cleanly."},
+        ),
+    ]
+    frozen_ev = seal(
+        build_event(
+            source="kanban", kind=KIND_TASK_COMMENT, ts=7.0,
+            profile="unmapped-role-deadbeef", actor="unmapped-role-deadbeef",
+            subject="t3", payload={"task_id": "t3", "text": "The queue is frozen again."},
+            store="kanban", table="task_comments", pk="t3-k-unmapped",
+        ),
+        {"task_id": "t3", "text": "The queue is frozen again."},
+    )
+    blank_ev = seal(
+        build_event(
+            source="kanban", kind=KIND_TASK_COMMENT, ts=7.0,
+            profile="unmapped-role-deadbeef", actor="unmapped-role-deadbeef",
+            subject="t3", payload={"task_id": "t3", "text": "Users see blank pages on checkout."},
+            store="kanban", table="task_comments", pk="t3-k-blank",
+        ),
+        {"task_id": "t3", "text": "Users see blank pages on checkout."},
+    )
+    relief_ev = seal(
+        build_event(
+            source="kanban", kind=KIND_TASK_COMMENT, ts=7.0,
+            profile="unmapped-role-deadbeef", actor="unmapped-role-deadbeef",
+            subject="t3", payload={"task_id": "t3", "text": "Glad the bug is behind us. Thanks, everyone!"},
+            store="kanban", table="task_comments", pk="t3-k-relief",
+        ),
+        {"task_id": "t3", "text": "Glad the bug is behind us. Thanks, everyone!"},
+    )
+    meeting_notes = "Added the queue lock summary to Friday's meeting notes."
+    retry_notes = "Meeting notes updated: review retry checklist next Monday."
+    for mapped_actor in ("Kensei", "Maren"):
+        notes_ev = seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=8.0,
+                profile=mapped_actor, actor=mapped_actor,
+                subject="t3", payload={"task_id": "t3", "text": meeting_notes},
+                store="kanban", table="task_comments", pk=f"t3-notes-{mapped_actor}",
+            ),
+            {"task_id": "t3", "text": meeting_notes},
+        )
+        brief_a = build_brief("t3", "task", base_rows + [frozen_ev, notes_ev])
+        assert brief_a.outcome == "The queue is frozen again."
+        assert brief_a.outcome_event_id == frozen_ev.id
+        assert frozen_ev.id in brief_a.post_completion_event_ids
+        assert any(turn.event_id == frozen_ev.id for turn in brief_a.turns)
+
+        brief_c = build_brief("t3", "task", base_rows + [blank_ev, notes_ev])
+        assert brief_c.outcome == "Users see blank pages on checkout."
+        assert brief_c.outcome_event_id == blank_ev.id
+        assert blank_ev.id in brief_c.post_completion_event_ids
+        assert any(turn.event_id == blank_ev.id for turn in brief_c.turns)
+
+        brief_d = build_brief("t3", "task", base_rows + [relief_ev, notes_ev])
+        assert brief_d.outcome == "Fixed the queue lock cleanly."
+        assert relief_ev.id not in brief_d.post_completion_event_ids
+        assert all(turn.event_id != relief_ev.id for turn in brief_d.turns)
+
+    retry_notes_ev = seal(
+        build_event(
+            source="kanban", kind=KIND_TASK_COMMENT, ts=8.0,
+            profile="Kensei", actor="Kensei",
+            subject="t3", payload={"task_id": "t3", "text": retry_notes},
+            store="kanban", table="task_comments", pk="t3-retry-notes",
+        ),
+        {"task_id": "t3", "text": retry_notes},
+    )
+    brief_b = build_brief("t3", "task", base_rows + [frozen_ev, retry_notes_ev])
+    assert frozen_ev.id in brief_b.post_completion_event_ids
+    assert any(turn.event_id == frozen_ev.id for turn in brief_b.turns)
