@@ -324,13 +324,14 @@ def rank_candidates(candidates: Sequence[StoryCandidate]) -> list[StoryCandidate
 
 
 def select_stories(
-    events: Iterable[GatedEvent], *, limit: int = 3
+    events: Iterable[GatedEvent], *, limit: int | None = 3
 ) -> tuple[list[StoryCandidate], list[StoryCandidate]]:
-    """Return (selected, all_candidates) ordered best first."""
+    """Return (selected, all_candidates) ordered best first. ``limit=None`` keeps all eligible."""
     candidates = build_candidates(events)
     eligible = sorted(
         (candidate for candidate in candidates if candidate.eligible),
         key=lambda candidate: candidate.score,
         reverse=True,
     )
-    return eligible[:limit], candidates
+    selected = eligible if limit is None else eligible[:limit]
+    return selected, candidates

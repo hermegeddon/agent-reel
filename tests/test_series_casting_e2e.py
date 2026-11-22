@@ -579,3 +579,175 @@ def test_e2e_cli_multi_harness_plan_and_dual_source_render_with_zero_leaks(tmp_p
     ) == 0
     legacy_sidecar = json.loads((legacy_out / "sidecar.json").read_text(encoding="utf-8"))
     assert "cast_binding" not in legacy_sidecar
+
+
+def test_adding_costar_preserves_chapter_one_renderability(tmp_path, monkeypatch):
+    home = tmp_path / "hermes_home"
+    kdb = home / "kanban.db"
+    kdb.parent.mkdir(parents=True, exist_ok=True)
+    kconn = sqlite3.connect(kdb)
+    kconn.execute(
+        "CREATE TABLE IF NOT EXISTS tasks ("
+        "id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT, status TEXT, "
+        "priority INTEGER, created_by TEXT, created_at REAL, started_at REAL, completed_at REAL, "
+        "tenant TEXT, project_id TEXT, result TEXT)"
+    )
+    kconn.execute(
+        "CREATE TABLE IF NOT EXISTS task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, "
+        "kind TEXT, payload TEXT, created_at REAL)"
+    )
+    kconn.execute(
+        "CREATE TABLE IF NOT EXISTS task_runs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, profile TEXT, step_key TEXT, "
+        "status TEXT, started_at REAL, ended_at REAL, outcome TEXT, summary TEXT, error TEXT)"
+    )
+    kconn.execute(
+        "CREATE TABLE IF NOT EXISTS task_comments ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, author TEXT, body TEXT, created_at REAL)"
+    )
+    kconn.execute(
+        "INSERT INTO tasks (id, title, body, assignee, status, priority, created_by, created_at, started_at, completed_at, result) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "t-ch1",
+            "Stabilize queue lock guard",
+            "Stabilize queue lock guard.",
+            "default",
+            "completed",
+            1,
+            "owner",
+            NOW - 7200,
+            NOW - 7000,
+            NOW - 6000,
+            "Fixed the queue lock cleanly with 18 tests passing.",
+        ),
+    )
+    for msg, ts_val in (
+        ("Decided to audit the stalled queue lock timeout.", NOW - 6900),
+        ("Found a blocked lock timeout across worker retries.", NOW - 6800),
+        ("Diagnosed flaky retry failure inside queue worker.", NOW - 6700),
+        ("Approved adding clean retry guard and timeout cap.", NOW - 6600),
+    ):
+        kconn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+            ("t-ch1", "default", msg, ts_val),
+        )
+    kconn.commit()
+    kconn.close()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("REEL_ALLOW_CUSTOM_STATE", "1")
+
+    assets = tmp_path / "assets"
+    _make_kit(assets, "placeholder-lead", "Rowan", role="hero")
+    _make_kit(assets, "placeholder-claude", "Cinder")
+    kits = load_kits(REPO_ROOT / "kits", assets / "kits")
+    approvals = Approvals.load(assets / "approvals.json")
+    for slug in ("placeholder-lead", "kensei", "placeholder-claude"):
+        approvals.approve(kits[slug], "anime")
+
+    cast_file = tmp_path / "cast.json"
+    cast_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "preserve-ch1",
+                "assets_dir": str(assets),
+                "owner": {"name": "Rowan", "kit": "placeholder-lead"},
+                "roles": {"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan_dir = tmp_path / "plan"
+    harness = _FakeE2EHarness()
+    assert _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness,
+        argv=[
+            "plan", "--dry-run",
+            "--data-dir", str(plan_dir),
+            "--cast-config", str(cast_file),
+            "--episodes", "1",
+        ],
+        default_dir=tmp_path / "default_data",
+    ) == 0
+    ir1_before = (plan_dir / "script-ir-1.json").read_bytes()
+
+    # Add co-star Cinder (`hermes:claude`) and plan Chapter 2 in the SAME plan_dir.
+    _add_hermes_session(
+        home / "profiles" / "claude" / "state.db",
+        session_id="sess-ch2",
+        profile="claude",
+        topic="scheduler",
+        base_ts=NOW - 3600,
+    )
+    cast_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "series_id": "preserve-ch1",
+                "assets_dir": str(assets),
+                "owner": {"name": "Rowan", "kit": "placeholder-lead"},
+                "roles": {
+                    "hermes:default": {"name": "Kensei", "kit": "kensei"},
+                    "hermes:claude": {"name": "Cinder", "kit": "placeholder-claude"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness,
+        argv=[
+            "plan", "--dry-run",
+            "--data-dir", str(plan_dir),
+            "--cast-config", str(cast_file),
+            "--all-profiles",
+            "--episodes", "1",
+        ],
+        default_dir=tmp_path / "default_data",
+    ) == 0
+
+    assert (plan_dir / "script-ir-1.json").read_bytes() == ir1_before
+    assert (plan_dir / "script-ir-2.json").is_file()
+
+    out1 = tmp_path / "render_ep1"
+    out2 = tmp_path / "render_ep2"
+    assert _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness,
+        argv=[
+            "render",
+            "--plan-dir", str(plan_dir),
+            "--episode", "1",
+            "--style", "anime",
+            "--assets-dir", str(assets),
+            "--out", str(out1),
+            "--source", "comfyui",
+            "--no-fillers",
+        ],
+        default_dir=assets,
+    ) == 0
+    assert _run_plan_and_render_with_harness(
+        monkeypatch,
+        harness,
+        argv=[
+            "render",
+            "--plan-dir", str(plan_dir),
+            "--episode", "2",
+            "--style", "anime",
+            "--assets-dir", str(assets),
+            "--out", str(out2),
+            "--source", "comfyui",
+            "--no-fillers",
+        ],
+        default_dir=assets,
+    ) == 0
+
+    m1 = json.loads((out1 / "render-manifest.json").read_text(encoding="utf-8"))
+    m2 = json.loads((out2 / "render-manifest.json").read_text(encoding="utf-8"))
+    assert all(req["bindings"].get("Kensei") == "kensei" and "Cinder" not in req["bindings"] for req in m1["requests"])
+    assert any(req["bindings"].get("Cinder") == "placeholder-claude" for req in m2["requests"])

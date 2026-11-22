@@ -906,10 +906,14 @@ def test_unmapped_participating_role_stops_episode_before_story_writing(tmp_path
             "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
             ("t-clean", "default", msg, ts_val),
         )
-    # Same-thread unmapped background run and short ack comment (unused by brief/arc/facts).
+    # Same-thread unmapped background run and incidental courtesy comments (must NOT veto episode).
     kconn_c.execute(
         "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
-        ("t-clean", "secret-unused", "ack", NOW - 4310),
+        ("t-clean", "secret-unused", "Thanks for the update.", NOW - 4310),
+    )
+    kconn_c.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+        ("t-clean", "secret-unused", "Got it, thanks for the update!", NOW - 3700),
     )
     kconn_c.execute(
         "INSERT INTO task_runs (task_id, profile, step_key, status, started_at, ended_at, outcome, summary, error) "
@@ -934,11 +938,12 @@ def test_unmapped_participating_role_stops_episode_before_story_writing(tmp_path
             writer_llm=writer_c,
         )
     )
-    assert res_c.events_ingested >= 12
+    assert res_c.events_ingested >= 13
     assert res_c.problems == [], res_c.problems
     assert len(res_c.episodes) == 1
     assert res_c.cast_diagnostics == []
     assert "secret-unused" not in json.dumps(writer_c.calls)
+    assert "Thanks for the update" not in json.dumps(writer_c.calls)
     assert "unmapped-role-" not in json.dumps(writer_c.calls)
     assert "unmapped-role-" not in (data_c / "script-ir-1.json").read_text(encoding="utf-8")
     assert "unmapped-role-" not in (data_c / "episode-1-script.md").read_text(encoding="utf-8")
@@ -978,7 +983,37 @@ def test_unmapped_participating_role_stops_episode_before_story_writing(tmp_path
 
 
 def test_series_and_cache_isolation_across_cast_revisions(tmp_path, monkeypatch):
-    home = _setup_hermes_home(tmp_path, default_turns=_default_story_turns())
+    home = _setup_hermes_home(tmp_path)
+    kconn = _init_kanban_db(home / "kanban.db")
+    kconn.execute(
+        "INSERT INTO tasks (id, title, body, assignee, status, priority, created_by, created_at, started_at, completed_at, result) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "t-ch1",
+            "Stabilize queue lock guard",
+            "Stabilize queue lock guard.",
+            "default",
+            "completed",
+            1,
+            "owner",
+            NOW - 7200,
+            NOW - 7000,
+            NOW - 6000,
+            "Fixed the queue lock cleanly with 18 tests passing.",
+        ),
+    )
+    for msg, ts_val in (
+        ("Decided to audit the stalled queue lock timeout.", NOW - 6900),
+        ("Found a blocked lock timeout across worker retries.", NOW - 6800),
+        ("Diagnosed flaky retry failure inside queue worker.", NOW - 6700),
+        ("Approved adding clean retry guard and timeout cap.", NOW - 6600),
+    ):
+        kconn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+            ("t-ch1", "default", msg, ts_val),
+        )
+    kconn.commit()
+    kconn.close()
     _bind_hermes_env(monkeypatch, home)
     assets = tmp_path / "assets"
     _make_kit(assets, "placeholder-lead", "Rowan")
@@ -1016,8 +1051,10 @@ def test_series_and_cache_isolation_across_cast_revisions(tmp_path, monkeypatch)
     assert loaded.cast_roles
     assert len(loaded.chapters) == 1
     assert (data_dir / "cache" / f"cast-continuity-{loaded.cast_digest}").is_dir()
+    ir1_bytes = (data_dir / "script-ir-1.json").read_bytes()
+    md1_bytes = (data_dir / "episode-1-script.md").read_bytes()
 
-    # Adding a co-star later in the same series is allowed cleanly (new cache dir, preserved series).
+    # Adding a co-star later in the same series is allowed cleanly (new cache dir, preserved series & Episode 1).
     _add_session(
         home / "profiles" / "claude" / "state.db",
         session_id="sess-claude-later",
@@ -1048,6 +1085,18 @@ def test_series_and_cache_isolation_across_cast_revisions(tmp_path, monkeypatch)
         )
     )
     assert res1b.problems == []
+    assert len(res1b.episodes) == 1
+    assert res1b.episodes[0]["number"] == 2
+    assert res1b.episodes[0]["chapter"] == 2
+    assert (data_dir / "script-ir-1.json").read_bytes() == ir1_bytes
+    assert (data_dir / "episode-1-script.md").read_bytes() == md1_bytes
+    assert (data_dir / "script-ir-2.json").is_file()
+    assert (data_dir / "episode-2-script.md").is_file()
+    assert (data_dir / "episode-2-trace.json").is_file()
+    ep1_chars = json.loads((data_dir / "script-ir-1.json").read_text(encoding="utf-8"))["cast_binding"]["characters"]
+    ep2_chars = json.loads((data_dir / "script-ir-2.json").read_text(encoding="utf-8"))["cast_binding"]["characters"]
+    assert set(ep1_chars) == {"Rowan", "Kensei"}
+    assert "Cinder" in ep2_chars and ep2_chars["Cinder"]["kit"] == "placeholder-claude"
     loaded_b = load_series(series_path)
     assert loaded_b.cast_digest != loaded.cast_digest
     assert len(loaded_b.chapters) == 2
@@ -1194,3 +1243,76 @@ def test_legacy_run_without_cast_config_unchanged(tmp_path, monkeypatch):
     assert "cast_binding" not in ir_data
     script_md = (data_dir / "episode-1-script.md").read_text(encoding="utf-8")
     assert "Sahil" in script_md
+
+
+def test_unmapped_higher_ranked_stories_do_not_crowd_out_eligible_story(tmp_path, monkeypatch):
+    home = _setup_hermes_home(tmp_path)
+    _bind_hermes_env(monkeypatch, home)
+
+    # Lower-ranked mapped story (`default`) has fewer text characters and fewer turns.
+    _add_session(
+        home / "state.db",
+        session_id="sess-mapped-small",
+        profile_name="default",
+        title="Patch cache timeout",
+        turns=[
+            ("user", "Fix the cache timeout check in the worker."),
+            ("assistant", "Checking the cache timeout value now."),
+            ("user", "Okay keep checking the worker path."),
+            ("assistant", "Fixed the cache timeout check and verified 12 tests pass."),
+        ],
+        base_ts=NOW - 9000,
+    )
+
+    # Five higher-ranked unmapped stories (> old limit=4 when episodes=1) must not crowd out `default`.
+    unmapped_profiles: list[str] = []
+    for idx in range(1, 6):
+        prof = f"secret-hi-{idx}"
+        unmapped_profiles.append(prof)
+        long_turns = _default_story_turns(f"unmapped-cluster-{idx}") + [
+            ("user", f"Critical traceback error and timeout failure in cluster {idx} service."),
+            ("assistant", f"Resolved timeout failure and crash regression in cluster {idx} with 40 tests green."),
+            ("user", f"Extra verification note for unmapped cluster {idx} rollout."),
+            ("assistant", f"Completed full verification pass on cluster {idx} cleanly."),
+        ]
+        _add_session(
+            home / "profiles" / prof / "state.db",
+            session_id=f"sess-hi-{idx}",
+            profile_name=prof,
+            title=f"Critical unmapped incident {idx}",
+            turns=long_turns,
+            base_ts=NOW - 5000 + idx * 120,
+        )
+
+    assets = tmp_path / "assets"
+    _make_kit(assets, "placeholder-lead", "Rowan")
+    cfg = _write_cast_config(
+        tmp_path / "cast.json",
+        series_id="no-crowd-out",
+        assets_dir=str(assets),
+        owner={"name": "Rowan", "kit": "placeholder-lead"},
+        roles={"hermes:default": {"name": "Kensei", "kit": "kensei"}},
+    )
+    writer = _RecordingLLM()
+    data_dir = tmp_path / "data"
+    res = pl.run_pipeline(
+        pl.PipelineConfig(
+            data_dir=data_dir,
+            state_dir=tmp_path / "state",
+            assets_dir=assets,
+            cast_config=cfg,
+            all_profiles=True,
+            episodes=1,
+            min_strip_panels=1,
+            use_model=True,
+            writer_llm=writer,
+        )
+    )
+    assert res.problems == [], res.problems
+    assert len(res.episodes) == 1
+    for prof in unmapped_profiles:
+        assert any(f"hermes:{prof}" in diag for diag in res.cast_diagnostics), prof
+        assert prof not in json.dumps(writer.calls)
+        for rel, text in _all_text_under(data_dir).items():
+            assert prof not in text, f"{prof} leaked into {rel}"
+    assert sum(1 for row in res.skipped_stories if "unmapped participating role" in row["reason"]) == 5

@@ -15,6 +15,7 @@ then checked against brief *plus* the cited events.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -29,6 +30,7 @@ from canon.events import (
     KIND_TOOL_CALL,
 )
 from canon.gate import GatedEvent, require_gated
+from canon.series_cast import is_unmapped_label
 
 MIN_GOAL_CHARS = 20
 MIN_OUTCOME_CHARS = 20
@@ -53,7 +55,34 @@ STORY_KINDS = frozenset(
 MACHINERY_KINDS = frozenset({KIND_TOOL_CALL, KIND_MESSAGE_TOOL_RESULT})
 
 #: Internal identifiers are not narrative text.
-_INTERNAL_ID = __import__("re").compile(r"\b(?:local|session|ev|thr|proc)[-_][0-9a-f]{6,}\b")
+_INTERNAL_ID = re.compile(r"\b(?:local|session|ev|thr|proc)[-_][0-9a-f]{6,}\b")
+
+_ACK_GREETING = r"(?:(?:hi|hey|hello)(?:[,!.\s]+(?:team|all|folks|there|everyone))?[,!.\s]+)?"
+_ACK_PHRASE = (
+    r"(?:ack|acknowledged|received|go received|copy(?: that)?|roger(?: that)?|"
+    r"understood|noted|got it|makes sense|sounds good|looks good|lgtm|\+1|"
+    r"will do|all good|no worries|no problem|np|cheers|"
+    r"(?:many )?(?:thanks|thank you|thx|ty)|(?:much )?appreciated|"
+    r"(?:i )?appreciate (?:it|that|the update|the note|the heads[- ]up|the info|this)|"
+    r"following along|watching this|watching|subscribed)"
+)
+_ACK_TAIL = (
+    r"(?:[,!\s]+(?:all|team|folks|everyone|here|again|so much|very much|a lot))?"
+    r"(?:\s+for (?:the )?(?:update|updates|heads[- ]up|note|notes|info|information|"
+    r"ping|status|context|summary|sharing|checking|letting me know|looking into (?:it|this)))?"
+)
+_INCIDENTAL_ACK = re.compile(
+    rf"^\s*{_ACK_GREETING}{_ACK_PHRASE}{_ACK_TAIL}(?:[,;\s\-\u2014]+{_ACK_PHRASE}{_ACK_TAIL})?[.!\s]*$",
+    re.IGNORECASE,
+)
+
+
+def is_incidental_acknowledgement(text: str) -> bool:
+    """True for brief courtesy replies, receipts, or watch-list notes without story substance."""
+    clean = " ".join(str(text or "").split())
+    if not clean or len(clean) > 100:
+        return False
+    return bool(_INCIDENTAL_ACK.match(clean))
 
 
 def looks_like_tool_payload(text: str) -> bool:
@@ -72,7 +101,10 @@ def is_story_event(event: GatedEvent) -> bool:
     """May this event's text be used in a brief?"""
     if event.kind in MACHINERY_KINDS or event.kind not in STORY_KINDS:
         return False
-    return not looks_like_tool_payload(event_text(event))
+    text = event_text(event)
+    if event.kind == KIND_TASK_COMMENT and is_incidental_acknowledgement(text):
+        return False
+    return not looks_like_tool_payload(text)
 
 
 def strip_internal_ids(text: str) -> str:
@@ -190,8 +222,13 @@ def _spread(candidates: list[tuple[GatedEvent, str]], limit: int) -> list[tuple[
 
 def _key_turns(events: Sequence[GatedEvent], *, limit: int = MAX_TURNS) -> tuple[BriefTurn, ...]:
     """Text-bearing events, distinct, spread across the thread, best first."""
-    candidates = [(event, event_text(event)) for event in events if is_story_event(event)]
-    candidates = [(event, text) for event, text in candidates if len(text) >= 12]
+    candidates = [
+        (event, text)
+        for event in events
+        if is_story_event(event)
+        for text in (event_text(event),)
+        if len(text) >= 12 and not is_incidental_acknowledgement(text)
+    ]
     if not candidates:
         return ()
     if limit > MAX_TURNS:
@@ -206,10 +243,12 @@ def _key_turns(events: Sequence[GatedEvent], *, limit: int = MAX_TURNS) -> tuple
     seen_text: set[str] = set()
     seen_actor: set[str] = set()
 
-    # Prefer an unseen actor and unseen text; then fall back to just unseen text.
+    # Prefer unseen mapped actors and unseen text; do not boost unmapped bystanders ahead of mapped turns.
     for event, text in candidates:
         actor = event.actor or event.profile or ""
         if text.lower() in seen_text:
+            continue
+        if is_unmapped_label(actor):
             continue
         if actor and actor in seen_actor and len(chosen) < limit - 1:
             continue
@@ -339,7 +378,7 @@ def build_brief(
                 for row in reversed(rows)
                 if (is_story_event(row) and row.kind == KIND_TASK_FINISHED)
                 or (row.kind == KIND_TASK_STATUS and str((row.payload or {}).get("kind")) == "completed")
-                or (row.kind == KIND_TASK_COMMENT and event_text(row))
+                or (row.kind == KIND_TASK_COMMENT and is_story_event(row) and event_text(row))
             ),
             None,
         )

@@ -1021,7 +1021,9 @@ def run_pipeline(
 
         # R3-F1: pick stories by meaning (sessions with a goal and an outcome, or task
         # families whose titles describe real work). Bookkeeping is never a story.
-        selected, all_candidates = select_stories(gated, limit=max(4, config.episodes * 4))
+        # Keep the full ranked list here; the loop stops once it reaches `episodes`,
+        # so skipped or unmapped top-ranked stories never crowd out eligible ones.
+        selected, all_candidates = select_stories(gated, limit=None)
         # Round 10: story rows carry text cut at 160 characters, and a cut can leave a
         # fragment the evidence writer reads as a secret (it refused the whole metrics file
         # on the September window). Re-gate the cut text so evidence holds the gated form.
@@ -1241,7 +1243,10 @@ def run_pipeline(
                 arc = _trim_arc(arc, config.strip_panels)
             # M3: one frame per chapter - a different world/villain/genre/motif/shot, drawn
             # deterministically from the hero and the chapter number, avoiding recent looks.
-            chapter_number = series.next_number + index - 1
+            # Advance saved episode numbers monotonically with the series ledger so
+            # follow-on runs (including adding co-stars) never overwrite prior plans.
+            chapter_number = series.next_number
+            episode_number = max(config.number + index - 1, chapter_number)
             frame = draw_frame(effective_hero, chapter_number, avoid=series.avoid())
 
             def _plan(episode_writer: Any, layer: str = "caption") -> EpisodeIR:
@@ -1251,7 +1256,7 @@ def run_pipeline(
                     canon,
                     format=config.format,
                     season=config.season,
-                    number=config.number + index - 1,
+                    number=episode_number,
                     writer=episode_writer,
                     hero=effective_hero,
                     grounder=grounder,
@@ -1369,11 +1374,11 @@ def run_pipeline(
             stray = masks_in(markdown_of(episode_ir))
             if stray:
                 result.problems.append(
-                    f"episode {index} still shows {len(stray)} redaction marker(s)"
+                    f"episode {episode_number} still shows {len(stray)} redaction marker(s)"
                 )
             episodes.append(
                 {
-                    "number": index,
+                    "number": episode_number,
                     "story_key": candidate.key,
                     "story_kind": candidate.kind,
                     "thread_kind": arc.thread_kind,

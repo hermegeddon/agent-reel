@@ -4,7 +4,20 @@ Series casting lets you explicitly bind your owner role and each participating a
 
 ## Quick start (two-character pilot)
 
-1. Create a working two-character `cast.json` (`schema_version: 1`) mapping `owner` and `hermes:default`. Only list roles whose kits already exist on disk (you can add more co-stars later once their kits are ready):
+1. **Prerequisite — prepare and approve your lead kit first.** `kensei` is bundled in the repository (`kits/kensei`), whereas `maren-lead` does **not** exist on disk until you add or generate it. Copying the example `cast.json` before `maren-lead` has an image sheet on disk fails preflight intentionally with `unknown kit 'maren-lead'` (zero LLM calls). Note also that `hermes reel kit create --dry-run` saves a sheetless draft kit, which still fails preflight until an actual sheet file is added (`hermes reel kit add`) or generated:
+
+```sh
+hermes reel kit add maren-lead \
+  --name Maren \
+  --style anime \
+  --sheet /path/to/maren-anime.png \
+  --assets-dir /path/to/assets
+
+hermes reel kit approve maren-lead --style anime --yes --assets-dir /path/to/assets
+hermes reel kit approve kensei --style anime --yes --assets-dir /path/to/assets
+```
+
+2. Create a working two-character `cast.json` (`schema_version: 1`) mapping `owner` and `hermes:default`. Only list roles whose non-draft kits already exist on disk (you can add more co-stars later once their kits are ready):
 
 ```json
 {
@@ -25,7 +38,7 @@ Series casting lets you explicitly bind your owner role and each participating a
 }
 ```
 
-2. Run `plan --dry-run` with `--cast-config`:
+3. Run `plan --dry-run` with `--cast-config`:
 
 ```sh
 hermes reel plan --dry-run \
@@ -34,7 +47,7 @@ hermes reel plan --dry-run \
   --data-dir /path/to/plan-out
 ```
 
-3. Render an episode against its saved kit bindings:
+4. Render an episode against its saved kit bindings:
 
 ```sh
 hermes reel render --plan-dir /path/to/plan-out --episode 1 --style anime --assets-dir /path/to/assets
@@ -55,13 +68,14 @@ hermes reel render --plan-dir /path/to/plan-out --episode 1 --style anime --asse
 Once you prepare a kit for another role (for example `harness:claude-code`), you can **add** that new role entry directly to your existing `cast.json` under the same `series_id`:
 
 - Keeping all previously recorded character bindings unchanged and adding new co-stars is allowed seamlessly in `series-<series_id>.json`, and model outputs run under a fresh `cache/cast-<series_id>-<cast_digest>/` directory.
+- Follow-on runs in the same `--data-dir` advance monotonically to the next episode number (`script-ir-2.json`, `episode-2-*`, rendered via `--episode 2`) rather than overwriting earlier episodes, so Chapter 1 (`script-ir-1.json`, rendered via `--episode 1`) stays intact with its original `cast_binding`.
 - Recasting an existing character (`name`, `kit`, or lead assignment) or removing an already-recorded role from the series ledger still fails preflight cleanly; start a new `series_id` or a fresh `--data-dir` when recasting existing characters.
 
 ## Participation, validation timing, and privacy
 
 - **Preflight (`0` LLM calls):** Malformed `cast.json`, duplicate/unsafe display names, missing or draft kits referenced in `cast.json`, and incompatible recasts/removals in `series-<series_id>.json` fail immediately with exit code `2`.
-- **Unmapped roles elsewhere or unused in the same thread do not block:** When `--all-profiles` or `kanban.db` encounters unmapped bystander roles—even in the same thread as an eligible story—unmapped events whose contributions are not relied on by the episode are isolated at the gate (`unmapped-role-<sha256[:8]>`), excluded from episode briefs/facts/beats and LLM payloads, and do not block planning.
-- **Relied-on unmapped participants skip only that episode before writing:** Before any writing-model call (`write_title`, `write_synopsis`, `plan_episode`), the pipeline determines which events the episode's brief (`goal`, `outcome`, `turns`), panel beats, and atomic facts rely on. If any relied-on event belongs to an unmapped role, only that episode is skipped (never silently recast), planning continues with any other eligible candidates, `metrics.json` records an opaque `unmapped-role-...` skip reason, and `hermes reel plan` prints the actionable missing role key locally.
+- **Unmapped roles elsewhere or unused in the same thread do not block:** When `--all-profiles` or `kanban.db` encounters unmapped bystander roles—even in the same thread as an eligible story—incidental courtesy replies/acknowledgements (such as `"Thanks for the update."`) and unmapped events whose contributions are not relied on by the episode are isolated at the gate (`unmapped-role-<sha256[:8]>`), excluded from episode briefs/facts/beats and LLM payloads, and do not block planning.
+- **Relied-on unmapped participants skip only that episode before writing (without crowding out eligible stories):** Before any writing-model call (`write_title`, `write_synopsis`, `plan_episode`), the pipeline determines which events the episode's brief (`goal`, `outcome`, `turns`), panel beats, and atomic facts rely on. If any relied-on event belongs to an unmapped role, only that episode is skipped (never silently recast), planning continues walking the full ranked candidate list until `--episodes` eligible episodes are planned or candidates are exhausted, `metrics.json` records an opaque `unmapped-role-...` skip reason, and `hermes reel plan` prints the actionable missing role key locally.
 - **Shareable `cast_binding` & consent separation:** Episode IR files (`script-ir-*.json`) and render outputs (`render-manifest.json`, `sidecar.json`) store `cast_binding` with display names, exact `kit` slugs, and `"lead": true|false` (narrative framing only)—never raw `hermes:<profile>` or `harness:<name>` role keys. Narrative `"lead": true` never grants permission to depict a real person; likeness and public-render consent always come strictly from the bound kit's own `real_person`, `owner`, and `public_consent` flags plus approved sheet digests in `approvals.json`.
 
 ## Rendering exact bound kits

@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
-from canon.brief import MAX_TURNS, MIN_TURNS, build_brief, event_text
+from canon.brief import (
+    MAX_TURNS,
+    MIN_TURNS,
+    build_brief,
+    event_text,
+    is_incidental_acknowledgement,
+    is_story_event,
+)
 from canon.events import (
     KIND_MESSAGE_ASSISTANT,
     KIND_MESSAGE_USER,
+    KIND_TASK_COMMENT,
     KIND_TASK_CREATED,
+    KIND_TASK_FINISHED,
     KIND_TASK_STATUS,
     build_event,
 )
@@ -130,3 +139,66 @@ def test_the_outcome_is_the_message_that_reports_a_result():
     brief = build_brief("s1", "session", rows)
     assert "87.3" in brief.outcome
     assert brief.outcome != "Go received."
+
+
+def test_incidental_acknowledgement_classifier():
+    for text in (
+        "ack",
+        "Thanks for the update.",
+        "Got it, thanks!",
+        "Got it, thanks for the update!",
+        "Following along here.",
+        "LGTM, thank you.",
+        "Hi team, looks good!",
+    ):
+        assert is_incidental_acknowledgement(text), f"expected incidental: {text!r}"
+
+    for substantive in (
+        "Hold release until retry check finishes.",
+        "Good, now prove it with strace",
+        "Thanks for fixing the lock timeout.",
+        "Verified queue tests stay green after restart.",
+    ):
+        assert not is_incidental_acknowledgement(substantive), f"expected substantive: {substantive!r}"
+
+
+def test_incidental_task_comment_after_completion_does_not_become_outcome_or_turn():
+    rows = [
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_CREATED, ts=1.0, profile="default", actor="owner",
+                subject="t2", payload={"task_id": "t2", "title": "Fix queue lock guard cleanly"},
+                store="kanban", table="tasks", pk="t2-c",
+            ),
+            {"task_id": "t2", "title": "Fix queue lock guard cleanly"},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=2.0, profile="default", actor="default",
+                subject="t2", payload={"task_id": "t2", "text": "Checked lock guard timeout across workers."},
+                store="kanban", table="task_comments", pk="t2-k1",
+            ),
+            {"task_id": "t2", "text": "Checked lock guard timeout across workers."},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_FINISHED, ts=3.0, profile="default", actor="default",
+                subject="t2", payload={"task_id": "t2", "text": "Fixed the queue lock cleanly."},
+                store="kanban", table="tasks", pk="t2-f",
+            ),
+            {"task_id": "t2", "text": "Fixed the queue lock cleanly."},
+        ),
+        seal(
+            build_event(
+                source="kanban", kind=KIND_TASK_COMMENT, ts=4.0, profile="default", actor="bystander",
+                subject="t2", payload={"task_id": "t2", "text": "Thanks for the update."},
+                store="kanban", table="task_comments", pk="t2-k2",
+            ),
+            {"task_id": "t2", "text": "Thanks for the update."},
+        ),
+    ]
+    assert not is_story_event(rows[-1])
+    brief = build_brief("t2", "task", rows)
+    assert brief.outcome == "Fixed the queue lock cleanly."
+    assert brief.outcome_event_id == rows[2].id
+    assert all("Thanks for the update" not in turn.text for turn in brief.turns)
