@@ -181,9 +181,9 @@ def interpret(
     on_model: Mapping[str, Any] = raw_on_model if isinstance(raw_on_model, dict) else {}
     lowered = {str(k).lower(): v for k, v in on_model.items()}
     for name in cast:
-        verdict = lowered.get(name.lower())
-        check.on_model[name] = bool(verdict)
-        if verdict is not True:
+        matches_reference = lowered.get(name.lower()) is True
+        check.on_model[name] = matches_reference
+        if not matches_reference:
             check.problems.append(f"{name} is off-model or not found")
     try:
         check.extra_people = int(answer.get("extra_people") or 0)

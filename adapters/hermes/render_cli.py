@@ -813,10 +813,11 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
     for attempt in range(1, max(0, args.retries) + 1):
         tag = f"retry{attempt}"
         for state in panel_states:
-            if state["path"] is None or state["check"] is None or state["check"].passed or state["vision_unavailable"]:
+            current_check = state["check"]
+            if state["path"] is None or current_check is None or current_check.passed or state["vision_unavailable"]:
                 continue
             request = state["request"]
-            retry_request = build_retry_request(request, state["check"], descriptions)
+            retry_request = build_retry_request(request, current_check, descriptions)
             if not renderer.can_render(retry_request, attempt_tag=tag):
                 if not budget_skip_noted:
                     print(f"budget: {renderer.budget} images reached; skipping remaining quality retries")
@@ -831,7 +832,13 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
             if vision_unavailable:
                 state["vision_unavailable"] = True
                 continue
-            if retry_check.passed or len(retry_check.problems) < len(state["check"].problems):
+            # Fewer review flags don't justify losing a previously on-model character.
+            if any(
+                was_on_model and not retry_check.on_model.get(name, False)
+                for name, was_on_model in current_check.on_model.items()
+            ):
+                continue
+            if retry_check.passed or len(retry_check.problems) < len(current_check.problems):
                 state["path"] = retry_path
                 state["check"] = retry_check
 

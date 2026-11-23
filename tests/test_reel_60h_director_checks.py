@@ -534,3 +534,33 @@ def test_render_cli_retry_feedback_and_no_unimproved_replacement(tmp_path, monke
     assert Path(rendered["8631b9fa519b-p2"]).name == "8631b9fa519b-p2.png"
     assert Path(rendered["8631b9fa519b-p3"]).name == "8631b9fa519b-p3-retry1.png"
     assert Path(rendered["8631b9fa519b-p4"]).name == "8631b9fa519b-p4-retry1.png"
+
+
+@pytest.mark.parametrize("off_model_verdict", [False, "false"], ids=["boolean", "malformed-string"])
+def test_render_cli_rejects_fewer_problems_if_retry_loses_cast_fidelity(tmp_path, monkeypatch, off_model_verdict):
+    assets_dir = tmp_path / "assets"
+    plan_dir = tmp_path / "plan"
+    out_dir = tmp_path / "render"
+    _make_approved_cast(assets_dir)
+    _write_test_plan(plan_dir)
+    panel_id = "8631b9fa519b-p2"
+
+    def vision_eval(img_name: str) -> dict:
+        first_attempt = img_name == f"{panel_id}.png"
+        retry = img_name == f"{panel_id}-retry1.png"
+        return {
+            "on_model": {"Maren": off_model_verdict if retry else True, "The Even Swap": True},
+            "extra_people": int(first_attempt),
+            "text_in_image": first_attempt,
+            "boxes": [{"label": "head:Maren", "box_2d": [320, 200, 480, 320]}],
+        }
+
+    rc, _ = _run_render_cli(
+        monkeypatch, plan_dir=plan_dir, assets_dir=assets_dir, out_dir=out_dir, vision_eval_fn=vision_eval,
+    )
+
+    report = json.loads((out_dir / "render-manifest.json").read_text(encoding="utf-8"))["report"]
+    assert (out_dir / "raw" / f"{panel_id}-retry1.png").is_file()
+    assert Path(report["rendered"][panel_id]).name == f"{panel_id}.png"
+    assert report["quality_retries"] == 1
+    assert rc == 1  # The retained initial image still has two review flags.
