@@ -26,9 +26,9 @@ from canon.events import make_event_id
 from canon.caption import (
     MAX_OWNER_QUOTE_WORDS,
     caption_problem,
-    caption_problem,
     compose_caption,
     looks_like_provenance,
+    trim_at_boundary,
     trim_caption,
 )
 from canon.grounding import ClaimGate, ClaimReport, GroundingReport
@@ -443,7 +443,8 @@ class LLMDialogueWriter:
             if not text:
                 continue
             if len(text) > self.max_chars:
-                text = text[: self.max_chars].rstrip() + "..."
+                # Trim cleanly on a sentence/clause/word boundary rather than slicing mid-word.
+                text = trim_at_boundary(text, self.max_chars)
             lines.append([speaker, text])
         if not lines and not caption:
             raise ValueError("model returned neither a caption nor a usable line")

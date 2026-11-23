@@ -247,6 +247,35 @@ def caption_problem(
     return ""
 
 
+def trim_at_boundary(text: str, max_chars: int, *, ending: str = "") -> str:
+    """Trim ``text`` within ``max_chars`` on a clause, sentence, or word boundary."""
+    clean = " ".join((text or "").split())
+    if max_chars <= 0 or len(clean) <= max_chars:
+        return clean
+    cutoff = max(1, max_chars - len(ending))
+    window = clean[:cutoff]
+    min_keep = max(12, cutoff // 2)
+    for pattern in (r"[.!?](?=\s|$)", r"[—;](?=\s|$|\w)", r",(?=\s|$)"):
+        matches = list(re.finditer(pattern, window))
+        if matches and matches[-1].start() >= min_keep:
+            pos = matches[-1].end() if pattern.startswith("[.!?]") else matches[-1].start()
+            trimmed = window[:pos].rstrip(" ,;:-—")
+            if trimmed:
+                if trimmed[-1] in ".!?":
+                    return trimmed
+                return trimmed + (ending or ".")
+    if len(clean) > cutoff and clean[cutoff] != " ":
+        last_space = window.rfind(" ")
+        if last_space >= min_keep // 2:
+            window = window[:last_space]
+    trimmed = window.rstrip(" ,;:-—")
+    if not trimmed:
+        trimmed = clean[:cutoff].rstrip()
+    if ending:
+        return trimmed if trimmed.endswith(ending) else f"{trimmed}{ending}"
+    return trimmed
+
+
 def trim_caption(caption: str, *, max_words: int = MAX_CAPTION_WORDS) -> str:
     """Cut a caption to the policy length on a word boundary, keeping the sentence."""
     words = " ".join((caption or "").split()).split()

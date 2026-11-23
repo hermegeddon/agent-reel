@@ -24,6 +24,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
+from canon.caption import trim_at_boundary
+
 SHOTS = ("extreme-long", "long", "full", "medium", "close", "extreme-close")
 ANGLES = ("eye", "low", "high", "dutch", "overhead")
 
@@ -462,6 +464,16 @@ def pick_villain(text: str) -> tuple[str, str]:
 def no_text(value: str) -> str:
     """Strip anything that would ask the image model to draw words."""
     cleaned = _TEXT_REQUEST.sub("", value or "")
+    cleaned = " ".join(cleaned.split())
+    # Quoted text removal can leave an orphan reporting verb right before punctuation
+    # (e.g. "displays show 'GREEN'." -> "displays show ."). Drop the orphan verb and space.
+    cleaned = re.sub(
+        r"\b(?:that\s+|which\s+)?(?:say(?:s|ing)?|read(?:s|ing)?|show(?:s|ing)?|display(?:s|ing)?)\s*(?=[.,;:!?]|$)",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
     return " ".join(cleaned.split()).strip(" ,;:")
 
 
@@ -548,7 +560,7 @@ def _repair(treatment: Treatment, ir: Mapping[str, Any]) -> Treatment:
         item.action = no_text(item.action) or "the heroes press on"
         for field_name in ("motion", "impact", "reaction", "camera"):
             value = no_text(getattr(item, field_name) or "").strip()
-            setattr(item, field_name, value[:160])
+            setattr(item, field_name, trim_at_boundary(value, 160))
         previous = (item.shot, item.angle)
     treatment.villain_look = no_text(treatment.villain_look)
     treatment.world = no_text(treatment.world) or WORLD_DEFAULT  # callers pass a style world through `direct`
@@ -561,7 +573,7 @@ def _repair(treatment: Treatment, ir: Mapping[str, Any]) -> Treatment:
         filler.action = no_text(filler.action) or "a quiet beat"
         for field_name in ("motion", "impact", "reaction", "camera"):
             value = no_text(getattr(filler, field_name) or "").strip()
-            setattr(filler, field_name, value[:160])
+            setattr(filler, field_name, trim_at_boundary(value, 160))
     # No two consecutive panels - story or filler - share both shot and angle.
     previous = None
     for pid, item in treatment.sequence(ir):
@@ -631,9 +643,9 @@ def direct(
     villain: Mapping[str, Any] = raw_villain if isinstance(raw_villain, dict) else {}
     default_name, default_look = pick_villain(story_text)
     treatment = Treatment(
-        villain_name="" if villainless else str(villain.get("name") or default_name)[:40],
-        villain_look="" if villainless else str(villain.get("look") or default_look)[:300],
-        world=str(answer.get("world") or world or WORLD_DEFAULT)[:300],
+        villain_name="" if villainless else trim_at_boundary(str(villain.get("name") or default_name), 40),
+        villain_look="" if villainless else trim_at_boundary(str(villain.get("look") or default_look), 300),
+        world=trim_at_boundary(str(answer.get("world") or world or WORLD_DEFAULT), 300),
         source="model",
         arc_type=arc_type,
     )

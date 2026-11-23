@@ -23,29 +23,32 @@ CHECK_QUESTION = (
     "You are checking one comic panel before lettering. Answer with JSON only, no prose.\n"
     "Scripted characters, left to right as staged: {cast}.\n"
     "Reference descriptions: {descriptions}.\n"
-    "Return: {{\"on_model\": {{NAME: true|false}}, \"extra_people\": INT, "
-    "\"text_in_image\": true|false, \"heads\": {{NAME: [x0, y0, x1, y1]}}, "
-    "\"free\": [[x0, y0, x1, y1], ...], \"keep_out\": [[x0, y0, x1, y1], ...]}}.\n"
-    "All boxes are fractions of width and height (0..1). heads = the tight box around "
-    "each scripted character's head and face only. free = empty background where speech "
-    "balloons can go without covering faces or key objects. keep_out = key objects or "
-    "action that must stay visible. extra_people = people or characters drawn who are not "
-    "in the scripted list. text_in_image = READABLE words or letters, speech bubbles or "
-    "captions drawn in the art; tiny unreadable interface or code squiggles on screens, "
-    "numerals on clock faces or dials, and lone symbols (?, !, arrows) do not count."
+    "Return JSON only: {{\"on_model\": {{NAME: true|false}}, \"extra_people\": INT, "
+    "\"text_in_image\": true|false, \"boxes\": [{{\"label\": str, \"box_2d\": [ymin, xmin, ymax, xmax]}}]}}.\n"
+    "Use 0..1000 integer coordinates [ymin, xmin, ymax, xmax] for every box_2d.\n"
+    "Detect in boxes:\n"
+    "- \"head:<NAME>\" tight around each visible scripted character's face/head/helmet only.\n"
+    "- \"protect\" boxes covering each character's full acting body, outstretched or gesturing hands, "
+    "drawn weapons/blades/tools, glowing impact bursts, and focal displays or props so lettering "
+    "never covers faces or key acting.\n"
+    "extra_people = people or characters drawn who are not in the scripted list.\n"
+    "text_in_image = READABLE words or letters, speech bubbles or captions drawn in the art; tiny "
+    "unreadable interface or code squiggles on screens, numerals on clock faces or dials, and lone symbols "
+    "(?, !, arrows) do not count."
 )
 
 LETTER_QUESTION = (
-    "Answer with JSON only. This comic panel has speech balloons added. For each balloon, "
-    "say whether its tail points at the face or head of the character named here as its "
-    "speaker: {speakers}. Return {{\"misses\": [SPEAKER, ...]}} listing every speaker whose "
-    "balloon tail does NOT point at them, or an empty list."
+    "Answer with JSON only. This comic panel has speech balloons and/or a yellow caption box added.\n"
+    "1) Check tail aiming for speakers: {speakers}.\n"
+    "2) Check whether ANY speech balloon or caption box overlaps a character's face/head, gesturing or "
+    "outstretched hand, active body pose, drawn weapon/blade, or key impact/action.\n"
+    "Return {{\"misses\": [SPEAKER, ...], \"occluded\": [SHORT_DESCRIPTION, ...]}} using empty lists when "
+    "every tail clearly aims at its speaker and all faces and key action remain unobstructed."
 )
 
 TIGHT_QUESTION = (
-    "Answer with JSON only. Give the TIGHT box around the head and face of {name} in this "
-    "comic panel, as fractions of width and height: {{\"head\": [x0, y0, x1, y1]}}. "
-    "The box must cover the head only, not the body."
+    "Answer with JSON only. Detect ONLY the head/face/helmet of {name} in 0..1000 integer coordinates "
+    "[ymin, xmin, ymax, xmax] (head only, not torso): {{\"box_2d\": [ymin, xmin, ymax, xmax]}}."
 )
 
 
@@ -92,6 +95,70 @@ def _box(value: Any) -> list[float] | None:
     return [round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)]
 
 
+def _box_2d_to_xy(value: Any) -> list[float] | None:
+    """Convert Gemini native ``[ymin, xmin, ymax, xmax]`` (``0..1000``) to ``[x0, y0, x1, y1]``."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        ymin, xmin, ymax, xmax = (float(v) for v in value)
+    except (TypeError, ValueError):
+        return None
+    if max(abs(ymin), abs(xmin), abs(ymax), abs(xmax)) > 1.0:
+        ymin, xmin, ymax, xmax = ymin / 1000.0, xmin / 1000.0, ymax / 1000.0, xmax / 1000.0
+    return _box((xmin, ymin, xmax, ymax))
+
+
+def parse_head_box(answer: Any) -> list[float] | None:
+    """Parse either ``{"box_2d": ...}``, ``{"boxes": [...]}``, or legacy ``{"head": ...}``."""
+    if not isinstance(answer, Mapping):
+        return None
+    if answer.get("box_2d") is not None:
+        return _box_2d_to_xy(answer.get("box_2d"))
+    raw_boxes = answer.get("boxes")
+    if isinstance(raw_boxes, list):
+        candidates = [item for item in raw_boxes if isinstance(item, Mapping)]
+        preferred = sorted(
+            candidates,
+            key=lambda item: (0 if str(item.get("label") or "").lower().startswith("head") else 1),
+        )
+        for item in preferred:
+            parsed = _box_2d_to_xy(item.get("box_2d"))
+            if parsed is not None:
+                return parsed
+    return _box(answer.get("head"))
+
+
+def _derive_free_regions(blocked: Sequence[Sequence[float]]) -> list[list[float]]:
+    """Derive open background rectangles that have zero overlap with ``blocked``."""
+    valid = [b for b in blocked if len(b) == 4]
+    if not valid:
+        return [[0.0, 0.0, 1.0, 0.30]]
+
+    candidates: list[list[float]] = []
+    for sx0, sx1 in ((0.0, 1.0), (0.0, 0.48), (0.52, 1.0), (0.0, 0.35), (0.65, 1.0)):
+        overlapping = [b for b in valid if b[2] > sx0 and b[0] < sx1]
+        y_ceil = min((b[1] for b in overlapping), default=1.0)
+        candidates.append([sx0, 0.0, sx1, y_ceil])
+
+    max_y1 = max(b[3] for b in valid)
+    if 1.0 - max_y1 >= 0.14:
+        candidates.append([0.0, max_y1, 1.0, 1.0])
+
+    free: list[list[float]] = []
+    seen: set[tuple[float, float, float, float]] = set()
+    for rect in candidates:
+        x0, y0, x1, y1 = (round(v, 4) for v in rect)
+        if x1 - x0 < 0.20 or y1 - y0 < 0.12:
+            continue
+        if any(min(x1, b[2]) > max(x0, b[0]) and min(y1, b[3]) > max(y0, b[1]) for b in valid):
+            continue
+        key = (x0, y0, x1, y1)
+        if key not in seen:
+            seen.add(key)
+            free.append([x0, y0, x1, y1])
+    return free
+
+
 def area(box: Sequence[float]) -> float:
     return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
 
@@ -125,25 +192,59 @@ def interpret(
     if check.text_in_image:
         check.problems.append("text drawn in the art")
 
-    raw_heads = answer.get("heads")
-    heads: Mapping[str, Any] = raw_heads if isinstance(raw_heads, dict) else {}
-    heads_lower = {str(k).lower(): v for k, v in heads.items()}
+    raw_boxes = answer.get("boxes")
+    heads_lower: dict[str, list[float]] = {}
+    parsed_keep_out: list[list[float]] = []
+    parsed_free: list[list[float]] = []
+    used_boxes = False
+
+    if isinstance(raw_boxes, list):
+        for item in raw_boxes:
+            if not isinstance(item, Mapping):
+                continue
+            label = str(item.get("label") or "").strip().lower()
+            box = _box_2d_to_xy(item.get("box_2d"))
+            if box is None:
+                continue
+            used_boxes = True
+            if label.startswith("head:"):
+                char_key = label.split(":", 1)[1].strip()
+                if char_key:
+                    heads_lower[char_key] = box
+            elif label == "free":
+                parsed_free.append(box)
+            else:
+                parsed_keep_out.append(box)
+
+    if not used_boxes:
+        raw_heads = answer.get("heads")
+        heads: Mapping[str, Any] = raw_heads if isinstance(raw_heads, dict) else {}
+        for k, v in heads.items():
+            box = _box(v)
+            if box is not None:
+                heads_lower[str(k).lower()] = box
+        parsed_free = [b for b in (_box(v) for v in answer.get("free") or []) if b]
+        parsed_keep_out = [b for b in (_box(v) for v in answer.get("keep_out") or []) if b]
+
     needed = {n.lower() for n in (require_heads if require_heads is not None else cast)}
     for name in cast:
-        box = _box(heads_lower.get(name.lower()))
+        box = heads_lower.get(name.lower())
         if box is None and name.lower() not in needed:
             continue
         if box is not None and area(box) > COARSE_HEAD_AREA and tighten is not None:
-            tight = tighten(name)
-            tight_box = _box((tight or {}).get("head")) if isinstance(tight, dict) else None
+            tight_box = parse_head_box(tighten(name))
             if tight_box is not None:
                 box = tight_box
         if box is None:
             check.problems.append(f"no head box for {name}")
             continue
         check.heads[name] = box
-    check.free = [b for b in (_box(v) for v in answer.get("free") or []) if b]
-    check.keep_out = [b for b in (_box(v) for v in answer.get("keep_out") or []) if b]
+
+    check.keep_out = parsed_keep_out
+    if used_boxes and not parsed_free:
+        check.free = _derive_free_regions(list(check.heads.values()) + check.keep_out)
+    else:
+        check.free = parsed_free
     if not check.free:
         check.problems.append("no free space for balloons reported")
     return check

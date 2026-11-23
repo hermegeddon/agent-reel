@@ -668,26 +668,33 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
             lines=[(speaker, display_text(text)) for speaker, text in lines],
             font_scale=PAGE_FONT_SCALE if treatment is not None else 1.0,
             look=letter_look,
+            allow_expand=True,
+            allow_shorten=True,
         )
         if lines and letter_report.balloons:
-            # Letterer self-check (bake-off r2): ask whether every tail points at its
-            # speaker; for any miss, re-ask that head tightly and letter once more.
+            # Letterer self-check (bake-off r2 + reel-k90): verify every tail aims cleanly
+            # at its speaker and no balloon/caption covers faces or protected acting.
             speakers = ", ".join(sorted({speaker for speaker, _ in lines}))
+            misses: list[str] = []
+            occluded: list[str] = []
             try:
                 tmp = out / "raw" / f"{request.panel_id}-lettered-check.jpg"
                 image.save(tmp, quality=85)
-                misses = ask(tmp, LETTER_QUESTION.format(speakers=speakers)).get("misses") or []
+                letter_eval = ask(tmp, LETTER_QUESTION.format(speakers=speakers))
+                misses = [str(m) for m in (letter_eval.get("misses") or []) if isinstance(m, str)]
+                occluded = [str(o) for o in (letter_eval.get("occluded") or []) if isinstance(o, str) and str(o).strip()]
                 tmp.unlink(missing_ok=True)
             except VisionError:
                 misses = []
+                occluded = []
             fixed_heads = dict(final_check.heads)
-            for name in [str(m) for m in misses if isinstance(m, str)]:
+            for name in misses:
                 key = next((k for k in fixed_heads if k.lower() == name.lower()), name)
                 try:
                     tight = ask(final_path, TIGHT_QUESTION.format(name=key))
-                    from canon.panel_check import _box
+                    from canon.panel_check import parse_head_box
 
-                    box = _box(tight.get("head"))
+                    box = parse_head_box(tight)
                     if box:
                         fixed_heads[key] = box
                 except VisionError:
@@ -702,8 +709,22 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
                     lines=[(speaker, display_text(text)) for speaker, text in lines],
                     font_scale=PAGE_FONT_SCALE if treatment is not None else 1.0,
                     look=letter_look,
+                    allow_expand=True,
+                    allow_shorten=True,
                 )
+                checks[-1]["heads"] = fixed_heads
                 checks[-1]["tail_misses_fixed"] = misses
+                try:
+                    tmp = out / "raw" / f"{request.panel_id}-lettered-recheck.jpg"
+                    image.save(tmp, quality=85)
+                    recheck = ask(tmp, LETTER_QUESTION.format(speakers=speakers))
+                    occluded = [str(o) for o in (recheck.get("occluded") or []) if isinstance(o, str) and str(o).strip()]
+                    tmp.unlink(missing_ok=True)
+                except VisionError:
+                    occluded = []
+            if occluded:
+                checks[-1]["lettering_occluded"] = occluded
+                flagged.append(f"{request.panel_id}: lettering occluded {'; '.join(occluded)}")
         checks[-1]["lettering"] = letter_report.as_dict()
         if not letter_report.complete:
             flagged.append(f"{request.panel_id}: could not place {', '.join(letter_report.unplaced)}")

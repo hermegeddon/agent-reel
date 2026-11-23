@@ -47,9 +47,35 @@ def compose(panels: Sequence[Image.Image], cols: int, title: str, footer: str = 
     if not panels:
         raise ValueError("no panels to compose")
     pw = max(p.size[0] for p in panels)
-    ph = max(p.size[1] for p in panels)
     scale = pw / 1536
     gap, head, foot = int(24 * scale) + 4, int(220 * scale) + 40, int(130 * scale) + 30
+    if cols == 1:
+        # Vertical strips preserve each panel's aspect ratio (including expanded headroom)
+        # instead of stretching landscape/tall panels to a uniform height.
+        resized = [
+            p.convert("RGB").resize((pw, max(1, round(p.size[1] * pw / max(1, p.size[0])))), Image.Resampling.LANCZOS)
+            for p in panels
+        ]
+        width = pw + 2 * gap
+        height = head + sum(p.size[1] for p in resized) + (len(resized) + 1) * gap + foot
+        page = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(page)
+        title_font = ImageFont.truetype(str(TITLE_FONT), max(24, int(120 * scale)))
+        small = ImageFont.truetype(str(BODY_FONT), max(14, int(32 * scale)))
+        draw.text((width / 2, head / 2 + 10), title, font=title_font, fill="black", anchor="mm")
+        y = head + gap
+        for panel in resized:
+            w, h = panel.size
+            page.paste(panel, (gap, y))
+            draw.rectangle([gap, y, gap + w, y + h], outline="black", width=max(3, int(8 * scale)))
+            y += h + gap
+        if footer:
+            draw.text((width - gap, height - foot / 2), footer, font=small, fill="black", anchor="rm")
+        if credit:
+            draw.text((gap, height - foot / 2), credit, font=small, fill="#555", anchor="lm")
+        return page
+
+    ph = max(p.size[1] for p in panels)
     rows = (len(panels) + cols - 1) // cols
     width = cols * pw + (cols + 1) * gap
     height = head + rows * ph + (rows + 1) * gap + foot
