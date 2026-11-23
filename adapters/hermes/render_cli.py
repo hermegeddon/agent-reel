@@ -66,6 +66,11 @@ def register_render_cli(subs: Any) -> None:
     render.add_argument("--allow-untested-style", action="store_true", help=argparse.SUPPRESS)
     render.add_argument("--strict-styles", action="store_true", help="refuse styles not yet tested on a real render")
     render.add_argument("--literal", action="store_true", help="no director: draw what literally happened")
+    render.add_argument(
+        "--shots",
+        default="",
+        help="explicit director shot constraints: list (long,close,full,medium) or panel=shot pairs (p2=close,hidden_problem=close)",
+    )
     render.add_argument("--assets-dir", default="", help="user styles/kits/approvals (default: plugin data dir)")
     render.add_argument("--source", default="", help="image source: host, openai, gemini, fal, comfyui (default: saved choice, else host)")
     render.add_argument("--model", default="", help="model for the source (default: the source's default)")
@@ -625,7 +630,7 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
     from canon.assets import clear_to_render
     from canon.export import export_episode
     from canon.letterer import LetterStyle
-    from canon.panel_prompt import build_episode_requests, episode_cast
+    from canon.panel_prompt import build_episode_requests, build_retry_request, episode_cast
     from canon.render import PanelRenderer, RenderError, RenderReport, write_render_manifest
 
     dispatch = getattr(ctx, "dispatch_tool", None)
@@ -639,6 +644,16 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
         print(f"no planned episode at {ir_path}; run `hermes reel plan --dry-run` first")
         return 2
     ir = json.loads(ir_path.read_text(encoding="utf-8"))
+    shot_plan: dict[str, str] | None = None
+    raw_shots = str(getattr(args, "shots", "") or "").strip()
+    if raw_shots:
+        from canon.director import resolve_shot_plan
+
+        try:
+            shot_plan = resolve_shot_plan(raw_shots, ir.get("panels", []) or [])
+        except ValueError as exc:
+            print(f"invalid --shots: {exc}")
+            return 2
     title = ir.get("logline") or "Agent Reel"
     trace_path = plan_dir / f"episode-{args.episode}-trace.json"
     if trace_path.is_file():
@@ -740,6 +755,7 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
             frame=ir.get("frame") if isinstance(ir.get("frame"), dict) else None,
             arc_type=str(ir.get("arc_type") or ""),
             world=style.world,
+            shot_plan=shot_plan,
         )
         if getattr(args, "no_fillers", False) and treatment.fillers:
             # 26/10/26: a four-panel example should be four panels, not four plus fillers.
@@ -800,21 +816,22 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
             if state["path"] is None or state["check"] is None or state["check"].passed or state["vision_unavailable"]:
                 continue
             request = state["request"]
-            if not renderer.can_render(request, attempt_tag=tag):
+            retry_request = build_retry_request(request, state["check"], descriptions)
+            if not renderer.can_render(retry_request, attempt_tag=tag):
                 if not budget_skip_noted:
                     print(f"budget: {renderer.budget} images reached; skipping remaining quality retries")
                     budget_skip_noted = True
                 continue
-            retry_path = renderer.render_one(request, raw_dir, report, attempt_tag=tag)
+            retry_path = renderer.render_one(retry_request, raw_dir, report, attempt_tag=tag)
             if retry_path is None:
                 continue
             report.record_quality_retry()
             panel = panels_by_id.get(request.panel_id, {})
-            retry_check, vision_unavailable = _evaluate_panel(retry_path, request, panel, descriptions, ask)
+            retry_check, vision_unavailable = _evaluate_panel(retry_path, retry_request, panel, descriptions, ask)
             if vision_unavailable:
                 state["vision_unavailable"] = True
                 continue
-            if retry_check.passed or len(retry_check.problems) <= len(state["check"].problems):
+            if retry_check.passed or len(retry_check.problems) < len(state["check"].problems):
                 state["path"] = retry_path
                 state["check"] = retry_check
 

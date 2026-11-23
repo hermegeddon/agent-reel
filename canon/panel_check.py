@@ -31,10 +31,14 @@ CHECK_QUESTION = (
     "- \"protect\" boxes covering each character's full acting body, outstretched or gesturing hands, "
     "drawn weapons/blades/tools, glowing impact bursts, and focal displays or props so lettering "
     "never covers faces or key acting.\n"
+    "on_model[NAME] = true only when the character matches their reference description, including "
+    "key outfit items, signature props, and distinctive traits (such as both faces of a two-faced "
+    "creature or a signature carried pack, tube, or weapon when visible in framing).\n"
     "extra_people = people or characters drawn who are not in the scripted list.\n"
-    "text_in_image = READABLE words or letters, speech bubbles or captions drawn in the art; tiny "
-    "unreadable interface or code squiggles on screens, numerals on clock faces or dials, and lone symbols "
-    "(?, !, arrows) do not count."
+    "text_in_image = true ONLY if there are legible words, readable letter sequences, speech bubbles, "
+    "or captions drawn in the art; abstract glowing monitor stripes, blurred or unreadable code "
+    "squiggles, status bars, waveforms, geometric UI lines, numerals on clock faces or dials, "
+    "and lone symbols (?, !, arrows) MUST return false."
 )
 
 LETTER_QUESTION = (

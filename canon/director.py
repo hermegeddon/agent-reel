@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping, Sequence
 from canon.caption import trim_at_boundary
 
 SHOTS = ("extreme-long", "long", "full", "medium", "close", "extreme-close")
+CLOSE_SHOTS = frozenset({"close", "extreme-close"})
 ANGLES = ("eye", "low", "high", "dutch", "overhead")
 
 SHOT_WORDS = {
@@ -240,6 +241,38 @@ def _frame_brief(frame: Mapping[str, Any] | None, *, villainless: bool = False) 
 WORLD_DEFAULT = "the place where the work happens, a desk and a screen in an ordinary lit room"
 
 _TEXT_REQUEST = re.compile(r"(\"[^\"]*\"|'[^']*'|\b(sign|banner|label|screen|text|words?|caption)s? (that )?(says?|reads?|showing)\b[^,.;]*)", re.I)
+_CLOSEUP_CUE = re.compile(r"\b(?:close[- ]?up|zoom(?:ed|ing)?\s+in|up\s+close|peer(?:s|ing)?\s+closely)\b", re.I)
+
+_SCREEN_WORDS = r"(?:screens?|monitors?|displays?|consoles?|terminals?|holograms?)"
+_SCREEN_ADJ = r"(?:diagnostic|terminal|code|text|log|status|readout|glowing|flickering|holographic|green|red|amber|cyan|main|central|wall|overhead)"
+_NON_CLAUSE_WORD = r"(?!and\b|or\b|but\b|as\b|while\b|when\b|where\b|that\b|which\b|who\b|by\b|at\b|on\b|in\b|to\b|from\b|into\b|onto\b|over\b|under\b|near\b|around\b|across\b|through\b|before\b|after\b|between\b)[a-z-]+"
+_SCREEN_WITH_TEXT_RE = re.compile(
+    rf"\b(?:{_SCREEN_ADJ}\s+)*(?P<dev>{_SCREEN_WORDS})"
+    r"\s+(?:that\s+|which\s+)?(?:(?:are|is)\s+)?"
+    r"(?:full\s+of|filled\s+with|covered\s+(?:in|with)|packed\s+with|crowded\s+with|flashing|streaming|scrolling|showing|displaying)\s+"
+    rf"(?:{_NON_CLAUSE_WORD}\s+){{0,4}}?"
+    r"(?:source\s+code|data\s+lines?|lines?\s+of\s+(?:code|text|logs?|output)|code|text|words?|letters?|numbers?|digits?|logs?|readouts?|messages?|errors?|warnings?|characters?|symbols?|output)\b",
+    re.I,
+)
+_CODE_LINES_RE = re.compile(
+    r"\b(?:(?P<art>an?|the)\s+)?(?:(?:specific|single|glowing|flashing|red|green|amber|cyan|highlighted|broken|failing|scrolling|streaming|corrupted|faulty)\s+)*"
+    r"(?P<unit>lines?|blocks?|snippets?|rows?|columns?|streams?|walls?)\s+of\s+"
+    r"(?:(?:source|terminal|console|diagnostic|error|status|log|green|red|glowing)\s+)*"
+    r"(?:data\s+text|code|text|logs?|output|errors?|warnings?|numbers?|digits?|characters?)\b",
+    re.I,
+)
+_TECH_TEXT_RE = re.compile(
+    r"\b(?:(?P<art>an?|the)\s+)?(?:(?:specific|single|glowing|flashing|red|green|amber|cyan|highlighted|broken|failing|scrolling|streaming|corrupted|faulty)\s+)*"
+    r"(?P<phrase>(?:error|warning|status|log|console|terminal|diagnostic|text|debug|system)\s+"
+    r"(?:messages?|readouts?|outputs?|logs?|entr(?:y|ies)|text|strings?|alerts?)|"
+    r"stack\s+traces?|tracebacks?|source\s+code|code\s+(?:snippets?|listings?|editors?|blocks?|lines?))\b",
+    re.I,
+)
+_TEXTY_SCREEN_ADJ_RE = re.compile(
+    rf"\b(?:diagnostic|terminal|code|text|log|status|readout)\s+(?P<dev>{_SCREEN_WORDS})\b",
+    re.I,
+)
+_POSSESSIVE_PREFIX_RE = re.compile(r"(?:\b(?:my|his|her|its|our|their|this|that|another|each|every|any|no|some)|['’]s)\s+$", re.I)
 
 DIRECTOR_PROMPT = (
     "You are the director of a short comic based on true events. Do NOT change any "
@@ -248,8 +281,11 @@ DIRECTOR_PROMPT = (
     "problem, a dramatic world, action, chases and fights. Rules: one villain for the "
     "episode, a creature or force, never a real person; the climax is the most dynamic "
     "panel (low or Dutch angle, full or long shot, impact); vary shot size and angle every "
-    "panel; the setup is an establishing extreme-long or long shot; never ask for text, "
-    "signs, labels or writing in the image. "
+    "panel; the setup is an establishing extreme-long or long shot; include at least one "
+    "close or extreme-close shot on strips of 3 or more panels (for diagnosis, discovery, "
+    "or reaction); never ask for text, signs, labels, writing, lines of code, terminal logs, "
+    "error messages, or readable readouts in the image; depict monitors or holographic "
+    "displays only as blank glow, abstract light, colour blocks, or geometric pulses. "
     "EVERY panel is a frozen moment of ACTION, not a pose: give action as what a body is "
     "doing right now (a verb, in motion: 'hurls the blade through the gate'), motion as the "
     "direction and energy ('left to right, cables whipping'), impact as what takes the hit "
@@ -461,8 +497,34 @@ def pick_villain(text: str) -> tuple[str, str]:
     return VILLAINS["default"]
 
 
+def _abstract_screen(match: re.Match[str]) -> str:
+    prefix = "Luminous" if match.start() == 0 else "luminous"
+    return f"{prefix} abstract {match.group('dev').lower()}"
+
+
+def _pulse_replacement(
+    text: str,
+    match: re.Match[str],
+    *,
+    plural: bool,
+    abstract_only: bool = False,
+) -> str:
+    art = (match.groupdict().get("art") or "").lower()
+    if abstract_only:
+        base = "the abstract glowing light" if art == "the" else "abstract glowing light"
+    elif plural:
+        base = "the bright signal pulses" if art == "the" else "bright signal pulses"
+    elif art == "the":
+        base = "the bright signal pulse"
+    elif not art and _POSSESSIVE_PREFIX_RE.search(text[:match.start()]):
+        base = "bright signal pulse"
+    else:
+        base = "a bright signal pulse"
+    return base[0].upper() + base[1:] if match.start() == 0 else base
+
+
 def no_text(value: str) -> str:
-    """Strip anything that would ask the image model to draw words."""
+    """Strip anything that would ask the image model to draw words or readable code."""
     cleaned = _TEXT_REQUEST.sub("", value or "")
     cleaned = " ".join(cleaned.split())
     # Quoted text removal can leave an orphan reporting verb right before punctuation
@@ -473,8 +535,160 @@ def no_text(value: str) -> str:
         cleaned,
         flags=re.I,
     )
+    cleaned = _SCREEN_WITH_TEXT_RE.sub(_abstract_screen, cleaned)
+    cleaned = _CODE_LINES_RE.sub(
+        lambda m: _pulse_replacement(cleaned, m, plural=m.group("unit").lower().endswith("s")),
+        cleaned,
+    )
+    cleaned = _TECH_TEXT_RE.sub(
+        lambda m: _pulse_replacement(
+            cleaned,
+            m,
+            plural=m.group("phrase").lower().endswith("s"),
+            abstract_only=m.group("phrase").lower() == "source code",
+        ),
+        cleaned,
+    )
+    cleaned = _TEXTY_SCREEN_ADJ_RE.sub(_abstract_screen, cleaned)
     cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
     return " ".join(cleaned.split()).strip(" ,;:")
+
+
+def parse_shot_plan(spec: str) -> dict[str, str] | list[str]:
+    """Parse ``--shots`` specs into a panel/role map or positional shot list."""
+    raw = (spec or "").strip()
+    if not raw:
+        return {}
+    tokens = [part.strip() for part in raw.split(",")]
+    non_empty = [tok for tok in tokens if tok]
+    if not non_empty:
+        return {}
+    if any("=" in tok for tok in non_empty):
+        mapping: dict[str, str] = {}
+        for tok in non_empty:
+            if "=" not in tok:
+                raise ValueError(f"mixed key=shot and bare shot token {tok!r}")
+            key, raw_shot = (piece.strip() for piece in tok.split("=", 1))
+            shot = raw_shot.lower()
+            if not key or shot not in SHOTS:
+                raise ValueError(f"invalid shot constraint {tok!r}; expected key=<{'|'.join(SHOTS)}>")
+            mapping[key] = shot
+        return mapping
+    shots: list[str] = []
+    for tok in tokens:
+        shot = tok.lower()
+        if shot and shot not in SHOTS:
+            raise ValueError(f"unknown shot {tok!r}; choose from {', '.join(SHOTS)}")
+        shots.append(shot)
+    return shots
+
+
+def resolve_shot_plan(
+    shot_plan: str | Sequence[str] | Mapping[str, str] | None,
+    panels: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    """Resolve an explicit shot plan into ``{panel_id: shot}``."""
+    if not shot_plan:
+        return {}
+    if isinstance(shot_plan, str):
+        parsed = parse_shot_plan(shot_plan)
+        if not parsed:
+            return {}
+        shot_plan = parsed
+
+    panel_list = list(panels)
+    panel_ids = [str(p.get("id")) for p in panel_list]
+    if isinstance(shot_plan, Mapping):
+        resolved: dict[str, str] = {}
+        for raw_key, raw_shot in shot_plan.items():
+            shot = str(raw_shot or "").strip().lower()
+            if not shot:
+                continue
+            if shot not in SHOTS:
+                raise ValueError(f"unknown shot {raw_shot!r}; choose from {', '.join(SHOTS)}")
+            key = str(raw_key).strip()
+            matched = [pid for pid in panel_ids if pid == key]
+            if not matched:
+                matched = [pid for pid in panel_ids if pid.endswith(f"-{key}")]
+            if not matched and key.isdigit():
+                idx = int(key) - 1
+                if 0 <= idx < len(panel_ids):
+                    matched = [panel_ids[idx]]
+            if not matched:
+                matched = [str(p.get("id")) for p in panel_list if str(p.get("role", "")) == key]
+            if not matched:
+                available = ", ".join(panel_ids) or "none"
+                raise ValueError(f"shot_plan key {raw_key!r} matched no panel (available: {available})")
+            for pid in matched:
+                resolved[pid] = shot
+        return resolved
+
+    if isinstance(shot_plan, Sequence) and not isinstance(shot_plan, (bytes, bytearray)):
+        resolved = {}
+        for index, raw_shot in enumerate(shot_plan):
+            shot = str(raw_shot or "").strip().lower()
+            if not shot:
+                continue
+            if shot not in SHOTS:
+                raise ValueError(f"unknown shot {raw_shot!r}; choose from {', '.join(SHOTS)}")
+            if index >= len(panel_ids):
+                raise ValueError(
+                    f"shot_plan has entry at index {index + 1}, but episode has {len(panel_ids)} panels"
+                )
+            resolved[panel_ids[index]] = shot
+        return resolved
+
+    raise ValueError(f"unsupported shot_plan type: {type(shot_plan).__name__}")
+
+
+def _cues_closeup(panel: Mapping[str, Any]) -> bool:
+    if str(panel.get("shot", "")).strip().lower() in CLOSE_SHOTS:
+        return True
+    chunks = [str(panel.get("caption") or "")]
+    chunks.extend(str(line.get("text") or "") for line in (panel.get("lines") or []))
+    return bool(_CLOSEUP_CUE.search(" ".join(chunks)))
+
+
+def _ensure_closeup_coverage(
+    treatment: Treatment,
+    ir: Mapping[str, Any],
+    pinned: Mapping[str, str],
+) -> None:
+    """Guarantee at least one close-up or extreme close-up on 3+ panel strips."""
+    story_panels = list(ir.get("panels", []) or [])
+    if len(story_panels) < 3:
+        return
+    if any(
+        treatment.panels.get(str(p.get("id"))) is not None
+        and treatment.panels[str(p.get("id"))].shot in CLOSE_SHOTS
+        for p in story_panels
+    ):
+        return
+
+    candidates = [
+        p
+        for p in story_panels
+        if str(p.get("id")) not in pinned and str(p.get("role", "")) not in {"climax", "setup"}
+    ]
+    if not candidates:
+        return
+
+    def _priority(panel: Mapping[str, Any]) -> int:
+        role = str(panel.get("role", ""))
+        if role == "diagnosis":
+            return 0
+        if _cues_closeup(panel):
+            return 1
+        if role == "hidden_problem":
+            return 2
+        if role in {"aftermath", "insert"}:
+            return 3
+        return 4
+
+    chosen = min(candidates, key=_priority)
+    pid = str(chosen.get("id"))
+    treatment.panels[pid].shot = "close"
+    treatment.repairs.append(f"{pid}: promoted to close-up for shot diversity")
 
 
 def _rules(
@@ -523,11 +737,16 @@ def _rules(
     return treatment
 
 
-def _repair(treatment: Treatment, ir: Mapping[str, Any]) -> Treatment:
+def _repair(
+    treatment: Treatment,
+    ir: Mapping[str, Any],
+    *,
+    shot_plan: Mapping[str, str] | None = None,
+) -> Treatment:
     """Enforce the craft rules on whatever the model returned."""
     arc_type = treatment.arc_type
     villainless = arc_type in NO_VILLAIN_TYPES
-    previous: tuple[str, str] | None = None
+    pinned = dict(shot_plan or {})
     for panel in ir.get("panels", []) or []:
         pid = str(panel.get("id"))
         role = str(panel.get("role", "aftermath"))
@@ -550,17 +769,29 @@ def _repair(treatment: Treatment, ir: Mapping[str, Any]) -> Treatment:
         elif arc_type == "mystery" and role != "climax" and item.villain_presence == "attacking" and role in {"setup", "hidden_problem", "diagnosis"}:
             treatment.repairs.append(f"{pid}: culprit kept out of frame until the reveal")
             item.villain_presence = "absent"
-        if role == "climax" and (item.angle not in {"low", "dutch"} or item.shot not in {"full", "long"}):
+        if pid in pinned:
+            if item.shot != pinned[pid]:
+                treatment.repairs.append(f"{pid}: shot pinned to {pinned[pid]} by shot_plan")
+                item.shot = pinned[pid]
+            if role == "climax" and item.angle not in {"low", "dutch"}:
+                treatment.repairs.append(f"{pid}: climax made dynamic")
+                item.angle = "low"
+        elif role == "climax" and (item.angle not in {"low", "dutch"} or item.shot not in {"full", "long"}):
             treatment.repairs.append(f"{pid}: climax made dynamic")
             item.shot, item.angle = "full", "low" if item.angle not in {"low", "dutch"} else item.angle
-        if previous == (item.shot, item.angle):
-            treatment.repairs.append(f"{pid}: repeated shot varied")
-            item.angle = next(a for a in ANGLES if a != item.angle and a != "overhead")
         item.location = no_text(item.location) or treatment.world
         item.action = no_text(item.action) or "the heroes press on"
         for field_name in ("motion", "impact", "reaction", "camera"):
             value = no_text(getattr(item, field_name) or "").strip()
             setattr(item, field_name, trim_at_boundary(value, 160))
+    _ensure_closeup_coverage(treatment, ir, pinned)
+    previous: tuple[str, str] | None = None
+    for panel in ir.get("panels", []) or []:
+        pid = str(panel.get("id"))
+        item = treatment.panels[pid]
+        if previous == (item.shot, item.angle):
+            treatment.repairs.append(f"{pid}: repeated shot varied")
+            item.angle = next(a for a in ANGLES if a != item.angle and a != "overhead")
         previous = (item.shot, item.angle)
     treatment.villain_look = no_text(treatment.villain_look)
     treatment.world = no_text(treatment.world) or WORLD_DEFAULT  # callers pass a style world through `direct`
@@ -595,6 +826,7 @@ def direct(
     frame: Mapping[str, Any] | None = None,
     arc_type: str = "",
     world: str = "",
+    shot_plan: str | Sequence[str] | Mapping[str, str] | None = None,
 ) -> Treatment:
     """A visual treatment for the episode: model when available, rules otherwise.
 
@@ -607,26 +839,43 @@ def direct(
     ``frame`` is the idea-deck draw for this chapter (world, villain archetype, genre,
     motif, opening shot). It fixes the look a chapter cannot repeat, while the facts of
     the episode still decide what happens.
+
+    ``shot_plan`` pins specific panel or role shots cleanly after directing.
     """
     arc_type = "" if arc_type == DEFAULT_TYPE else arc_type
     villainless = arc_type in NO_VILLAIN_TYPES
+    effective_plan = shot_plan if shot_plan is not None else ir.get("shot_plan")
+    resolved_shots = resolve_shot_plan(effective_plan, ir.get("panels", []) or [])
     frame_brief = _frame_brief(frame, villainless=villainless)
     if complete_json is None:
-        return _with_tone(_repair(_rules(ir, story_text, frame=frame, arc_type=arc_type, world=world), ir), tone)
+        return _with_tone(
+            _repair(_rules(ir, story_text, frame=frame, arc_type=arc_type, world=world), ir, shot_plan=resolved_shots),
+            tone,
+        )
     panels = [
         {"id": p.get("id"), "role": p.get("role"), "caption": p.get("caption", ""),
          "lines": [f"{l.get('speaker')}: {l.get('text')}" for l in p.get("lines", [])],
          "cast": list(p.get("cast", []))}
         for p in ir.get("panels", []) or []
     ]
+    prompt = DIRECTOR_PROMPT + ARC_DIRECTION.get(arc_type, "") + (
+        f" The art style's own world is: {world}. Stay inside it." if world else ""
+    )
+    payload: dict[str, Any] = {
+        "title": ir.get("logline", ""),
+        "story": story_text[:3000],
+        "panels": panels,
+        "visual_tone": tone,
+        "frame": frame_brief,
+        **({"story_shape": arc_type} if arc_type else {}),
+    }
+    if resolved_shots:
+        prompt += " Follow shot_plan exactly for every panel id listed there."
+        payload["shot_plan"] = resolved_shots
     try:
         answer = complete_json(
-            prompt=DIRECTOR_PROMPT + ARC_DIRECTION.get(arc_type, "") + (
-                f" The art style's own world is: {world}. Stay inside it." if world else ""
-            ),
-            payload={"title": ir.get("logline", ""), "story": story_text[:3000], "panels": panels,
-                     "visual_tone": tone, "frame": frame_brief,
-                     **({"story_shape": arc_type} if arc_type else {})},
+            prompt=prompt,
+            payload=payload,
             schema_hint={
                 "villain": {"name": "str", "look": "str"},
                 "world": "str",
@@ -636,7 +885,10 @@ def direct(
             stage="episode.director",
         )
     except Exception:  # noqa: BLE001 - a missing director never blocks a render
-        fallback = _with_tone(_repair(_rules(ir, story_text, arc_type=arc_type, world=world), ir), tone)
+        fallback = _with_tone(
+            _repair(_rules(ir, story_text, frame=frame, arc_type=arc_type, world=world), ir, shot_plan=resolved_shots),
+            tone,
+        )
         fallback.repairs.append("director model unavailable; rules used")
         return fallback
     raw_villain = answer.get("villain")
@@ -672,7 +924,7 @@ def direct(
         treatment.repairs.append("fillers: model count off target; rule fillers used")
     else:
         treatment.fillers = model_fillers
-    return _with_tone(_repair(treatment, ir), tone)
+    return _with_tone(_repair(treatment, ir, shot_plan=resolved_shots), tone)
 
 
 def _with_tone(treatment: Treatment, tone: str) -> Treatment:
@@ -681,4 +933,17 @@ def _with_tone(treatment: Treatment, tone: str) -> Treatment:
     return treatment
 
 
-__all__: Sequence[str] = ("Treatment", "PanelTreatment", "ARC_DIRECTION", "NO_VILLAIN_TYPES", "direct", "pick_villain", "no_text", "SHOT_WORDS", "ANGLE_WORDS")
+__all__: Sequence[str] = (
+    "Treatment",
+    "PanelTreatment",
+    "ARC_DIRECTION",
+    "CLOSE_SHOTS",
+    "NO_VILLAIN_TYPES",
+    "direct",
+    "no_text",
+    "parse_shot_plan",
+    "pick_villain",
+    "resolve_shot_plan",
+    "SHOT_WORDS",
+    "ANGLE_WORDS",
+)

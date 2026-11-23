@@ -13,11 +13,13 @@ The caption is post-gate text. It is passed as scene context so the picture show
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from canon.assets import CharacterKit, StyleCard
+from canon.caption import trim_at_boundary
 
 POSITIONS = ("LEFT", "RIGHT", "CENTRE")
 ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth")
@@ -51,6 +53,15 @@ class PromptError(ValueError):
 
 #: The climax frame when a style does not describe its own: no speed lines, no debris, no genre.
 IMPACT_DEFAULT = "Full-bleed impact frame: the decisive moment at the centre of the composition."
+
+_SCREEN_MENTION_RE = re.compile(
+    r"\b(?:screens?|monitors?|displays?|consoles?|terminals?|holograms?|holographic)\b",
+    re.I,
+)
+SCREEN_HYGIENE_RULE = (
+    "Any screens, consoles, monitors, or holographic displays show only blank light, "
+    "abstract colour blocks, or geometric pulses with zero letters, code, or numbers."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +200,8 @@ def build_panel_request(
             "The reference sheets fix WHO each character is (face, hair, build, outfit design); "
             "redraw them entirely in the art style described here, not in the sheets' style."
         )
+    if _SCREEN_MENTION_RE.search(" ".join(parts)):
+        parts.append(SCREEN_HYGIENE_RULE)
     comic_rules = (
         "This is ONE PANEL of a comic page. Keep the top quarter of the frame as open "
         "background for speech balloons added later."
@@ -283,6 +296,49 @@ def filler_panel(item: Any) -> dict[str, Any]:
     }
 
 
+def build_retry_request(
+    request: PanelRequest,
+    check: Any,
+    descriptions: Mapping[str, str] | None = None,
+) -> PanelRequest:
+    """Append targeted fix instructions and trait-preservation guidance for a quality retry."""
+    fixes: list[str] = []
+    if bool(getattr(check, "text_in_image", False)):
+        fixes.append(
+            "Remove all text, letters, numbers, code lines, and readouts; keep any screens "
+            "or displays blank or filled only with abstract geometric light or colour blocks."
+        )
+    if int(getattr(check, "extra_people", 0) or 0) > 0:
+        cast_list = ", ".join(request.cast) or "none"
+        fixes.append(f"Draw ONLY the scripted characters ({cast_list}) with zero extra background people.")
+    on_model = getattr(check, "on_model", None) or {}
+    off_model = [name for name in request.cast if on_model.get(name) is False]
+    if off_model:
+        fixes.append(
+            f"Match {', '.join(off_model)} accurately to their reference sheet face, hair, outfit, and colours."
+        )
+    problems = [str(p) for p in (getattr(check, "problems", ()) or ())]
+    if any(p.startswith("no head box for ") for p in problems):
+        fixes.append("Keep every speaking character's face and head clearly visible and unobstructed.")
+    if any("no free space for balloons" in p for p in problems):
+        fixes.append("Leave the top 25 percent of the frame as open uncluttered background.")
+    if descriptions:
+        trait_bits = [
+            f"{name}: {str(descriptions[name]).strip()}"
+            for name in request.cast
+            if str(descriptions.get(name) or "").strip()
+        ]
+        if trait_bits:
+            joined = trim_at_boundary("; ".join(trait_bits), 320).rstrip(".")
+            fixes.append(
+                "Preserve every character's signature props, outfit details, and distinctive traits "
+                f"from the reference sheets without dropping anything ({joined})."
+            )
+    if not fixes:
+        return request
+    return replace(request, prompt=f"{request.prompt} RETRY CORRECTION: {' '.join(fixes)}")
+
+
 def episode_cast(ir: Mapping[str, Any]) -> list[str]:
     seen: list[str] = []
     for panel in ir.get("panels", []) or []:
@@ -295,8 +351,10 @@ def episode_cast(ir: Mapping[str, Any]) -> list[str]:
 __all__: Sequence[str] = (
     "PanelRequest",
     "PromptError",
+    "SCREEN_HYGIENE_RULE",
     "build_episode_requests",
     "build_panel_request",
+    "build_retry_request",
     "episode_cast",
     "staging_order",
 )
