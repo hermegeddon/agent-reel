@@ -57,6 +57,11 @@ def register_render_cli(subs: Any) -> None:
         action="store_true",
         help="story panels only: skip the wordless filler panels between them",
     )
+    render.add_argument(
+        "--save-villain-kit",
+        action="store_true",
+        help="also save auto-generated villain reference sheets into assets/kits/",
+    )
     render.add_argument("--public", action="store_true", help="public mode: real people need consent")
     render.add_argument("--allow-untested-style", action="store_true", help=argparse.SUPPRESS)
     render.add_argument("--strict-styles", action="store_true", help="refuse styles not yet tested on a real render")
@@ -412,23 +417,49 @@ def _story_text(plan_dir: Path, episode: int, ir: Mapping[str, Any]) -> str:
     return "\n".join(p for p in parts if p.strip())
 
 
-def _villain_sheet(treatment: Any, style: Any, kits: Mapping[str, Any], renderer: Any, root: Path, raw_dir: Path, report: Any) -> Path | None:
-    """One reference sheet per villain and style, made once and reused (V3).
+def _write_villain_kit(kit_target: Path, source_image: Path, treatment: Any, style: Any) -> Path:
+    kit_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source_image, kit_target)
+    (kit_target.parent / "kit.json").write_text(json.dumps({
+        "name": treatment.villain_name, "role": "villain", "description": treatment.villain_look,
+        "sheets": {style.key: kit_target.name}, "real_person": False, "generated": True,
+        "licence": "generated for this project; fictional",
+    }, indent=1) + "\n", encoding="utf-8")
+    return kit_target
 
-    Villains are fictional creatures, never people, so no likeness approval applies. The
-    sheet is cached under the plugin data dir and listed in the render output for review.
+
+def _villain_sheet(
+    treatment: Any,
+    style: Any,
+    kits: Mapping[str, Any],
+    renderer: Any,
+    root: Path,
+    raw_dir: Path,
+    report: Any,
+    *,
+    save_to_kits: bool = False,
+    reserve_budget: int = 0,
+) -> Path | None:
+    """One reference sheet per villain and style, made once and cached (V3).
+
+    Auto-generated sheets live under ``cache/villains/`` so curated ``kits/`` is left
+    untouched unless ``save_to_kits=True``. Defers when ``reserve_budget`` needs the call.
     """
     import re
 
     from canon.panel_prompt import PanelRequest
 
     slug = re.sub(r"[^a-z0-9]+", "-", treatment.villain_name.lower()).strip("-") or "villain"
-    target = root / "kits" / f"villain-{slug}" / f"{style.key}.png"
-    if target.is_file():
-        return target
-    builtin = kits.get(slug) or kits.get(slug.removeprefix("the-"))
+    builtin = kits.get(slug) or kits.get(slug.removeprefix("the-")) or kits.get(f"villain-{slug}")
     if builtin is not None and style.key in builtin.sheets and builtin.sheets[style.key].is_file():
         return builtin.sheets[style.key]
+    kit_target = root / "kits" / f"villain-{slug}" / f"{style.key}.png"
+    cache_target = root / "cache" / "villains" / f"villain-{slug}" / f"{style.key}.png"
+    if save_to_kits and kit_target.is_file():
+        return kit_target
+    if cache_target.is_file():
+        return _write_villain_kit(kit_target, cache_target, treatment, style) if save_to_kits else cache_target
+
     style_ref = next((ref for ref in style.refs if Path(ref).is_file()), None)
     prompt = (
         f"Character reference sheet of a comic villain: {treatment.villain_look}. "
@@ -439,17 +470,19 @@ def _villain_sheet(treatment: Any, style: Any, kits: Mapping[str, Any], renderer
     )
     request = PanelRequest(panel_id=f"villain-{slug}", prompt=prompt,
                            references=(Path(style_ref),) if style_ref else (), cast=(), positions={}, aspect="landscape")
+    if reserve_budget > 0 and hasattr(renderer, "calls_made") and hasattr(renderer, "budget"):
+        is_cached = renderer.is_cached(request) if hasattr(renderer, "is_cached") else False
+        if not is_cached and renderer.calls_made + 1 + reserve_budget > renderer.budget:
+            print(f"skipping villain sheet {treatment.villain_name!r} to preserve budget for {reserve_budget} planned panels")
+            return None
     produced = renderer.render_one(request, raw_dir, report)
     if produced is None:
         return None
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(produced, target)
-    (target.parent / "kit.json").write_text(json.dumps({
-        "name": treatment.villain_name, "role": "villain", "description": treatment.villain_look,
-        "sheets": {style.key: target.name}, "real_person": False, "generated": True,
-        "licence": "generated for this project; fictional",
-    }, indent=1) + "\n", encoding="utf-8")
-    return target
+    cache_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(produced, cache_target)
+    if save_to_kits:
+        return _write_villain_kit(kit_target, cache_target, treatment, style)
+    return cache_target
 
 
 def prepare_host_tools() -> None:
@@ -467,16 +500,133 @@ def prepare_host_tools() -> None:
         print(f"warning: could not load the host tools ({type(exc).__name__}: {exc})")
 
 
+def _evaluate_panel(
+    path: Path,
+    request: Any,
+    panel: Mapping[str, Any],
+    descriptions: Mapping[str, str],
+    ask: Callable[[Path, str], dict[str, Any]],
+) -> tuple[Any, bool]:
+    """Run vision check + interpretation; mark ``vision_unavailable`` on ``VisionError``."""
+    from adapters.hermes.vision import VisionError
+    from canon.panel_check import PanelCheck, TIGHT_QUESTION, check_question, interpret
+
+    try:
+        answer = ask(path, check_question(list(request.cast), descriptions))
+        speakers = [str(l.get("speaker")) for l in panel.get("lines", [])]
+        check = interpret(
+            request.panel_id, list(request.cast), answer,
+            tighten=lambda name, p=path: ask(p, TIGHT_QUESTION.format(name=name)),
+            require_heads=speakers,
+        )
+        return check, False
+    except VisionError as exc:
+        # The check could not run. That says nothing about the panel, so it is not
+        # regenerated (the first real render paid for 4 needless images this way);
+        # it is flagged for a human look instead.
+        return PanelCheck(panel_id=request.panel_id, problems=[f"vision check unavailable: {str(exc)[:160]}"]), True
+
+
+def _letter_and_verify_panel(
+    final_path: Path,
+    final_check: Any,
+    request: Any,
+    panel: Mapping[str, Any],
+    *,
+    treatment: Any,
+    letter_look: Any,
+    ask: Callable[[Path, str], dict[str, Any]],
+    out: Path,
+    flagged: list[str],
+):
+    from PIL import Image
+
+    from adapters.hermes.vision import VisionError
+    from canon.letterer import letter_panel
+    from canon.panel_check import LETTER_QUESTION, TIGHT_QUESTION, parse_head_box
+
+    check_entry = final_check.as_dict()
+    lines = [(str(l.get("speaker", "")), str(l.get("text", ""))) for l in panel.get("lines", [])]
+    image, letter_report = letter_panel(
+        Image.open(final_path),
+        heads=final_check.heads,
+        free=final_check.free or [[0.05, 0.01, 0.95, 0.25]],
+        keep_out=final_check.keep_out,
+        caption=display_text(str(panel.get("caption", ""))),
+        lines=[(speaker, display_text(text)) for speaker, text in lines],
+        font_scale=PAGE_FONT_SCALE if treatment is not None else 1.0,
+        look=letter_look,
+        allow_expand=True,
+        allow_shorten=True,
+    )
+    if lines and letter_report.balloons:
+        # Letterer self-check (bake-off r2 + reel-k90): verify every tail aims cleanly
+        # at its speaker and no balloon/caption covers faces or protected acting.
+        speakers = ", ".join(sorted({speaker for speaker, _ in lines}))
+        misses: list[str] = []
+        occluded: list[str] = []
+        try:
+            tmp = out / "raw" / f"{request.panel_id}-lettered-check.jpg"
+            image.save(tmp, quality=85)
+            letter_eval = ask(tmp, LETTER_QUESTION.format(speakers=speakers))
+            misses = [str(m) for m in (letter_eval.get("misses") or []) if isinstance(m, str)]
+            occluded = [str(o) for o in (letter_eval.get("occluded") or []) if isinstance(o, str) and str(o).strip()]
+            tmp.unlink(missing_ok=True)
+        except VisionError:
+            misses = []
+            occluded = []
+        fixed_heads = dict(final_check.heads)
+        for name in misses:
+            key = next((k for k in fixed_heads if k.lower() == name.lower()), name)
+            try:
+                tight = ask(final_path, TIGHT_QUESTION.format(name=key))
+                box = parse_head_box(tight)
+                if box:
+                    fixed_heads[key] = box
+            except VisionError:
+                pass
+        if misses:
+            image, letter_report = letter_panel(
+                Image.open(final_path),
+                heads=fixed_heads,
+                free=final_check.free or [[0.05, 0.01, 0.95, 0.25]],
+                keep_out=final_check.keep_out,
+                caption=display_text(str(panel.get("caption", ""))),
+                lines=[(speaker, display_text(text)) for speaker, text in lines],
+                font_scale=PAGE_FONT_SCALE if treatment is not None else 1.0,
+                look=letter_look,
+                allow_expand=True,
+                allow_shorten=True,
+            )
+            check_entry["heads"] = fixed_heads
+            check_entry["tail_misses_fixed"] = misses
+            try:
+                tmp = out / "raw" / f"{request.panel_id}-lettered-recheck.jpg"
+                image.save(tmp, quality=85)
+                recheck = ask(tmp, LETTER_QUESTION.format(speakers=speakers))
+                occluded = [str(o) for o in (recheck.get("occluded") or []) if isinstance(o, str) and str(o).strip()]
+                tmp.unlink(missing_ok=True)
+            except VisionError:
+                occluded = []
+        if occluded:
+            check_entry["lettering_occluded"] = occluded
+            flagged.append(f"{request.panel_id}: lettering occluded {'; '.join(occluded)}")
+    check_entry["lettering"] = letter_report.as_dict()
+    if not letter_report.complete:
+        flagged.append(f"{request.panel_id}: could not place {', '.join(letter_report.unplaced)}")
+    return image, check_entry
+
+
 def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[[], Path]) -> int:
+    import time as _time
+
     from adapters.hermes.images import host_generator
     from adapters.hermes.vision import VisionError, host_vision
     from canon.assets import clear_to_render
     from canon.export import export_episode
-    from canon.letterer import LetterStyle, letter_panel
-    from canon.panel_check import LETTER_QUESTION, TIGHT_QUESTION, check_question, interpret
+    from canon.letterer import LetterStyle
     from canon.panel_prompt import build_episode_requests, episode_cast
     from canon.render import PanelRenderer, RenderError, RenderReport, write_render_manifest
-    from PIL import Image
 
     dispatch = getattr(ctx, "dispatch_tool", None)
     if dispatch is None:
@@ -559,6 +709,7 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
     # The cache key includes the source, so switching source never reuses another's images.
     renderer = PanelRenderer(generator, cache_dir=root / "cache" / "images" / (source if source != "host" else ""), budget=args.budget)
     report = RenderReport()
+    started = _time.time()
 
     # V1/V3: the director decides how each panel looks (villain, world, shot, angle). The
     # words are untouched. Without a model, a rule-based treatment is used.
@@ -596,7 +747,12 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
             treatment.fillers = []
         out.mkdir(parents=True, exist_ok=True)
         (out / "treatment.json").write_text(json.dumps(treatment.as_dict(), indent=1) + "\n", encoding="utf-8")
-        sheet = _villain_sheet(treatment, style, kits, renderer, root, raw_dir, report) if treatment.has_villain else None
+        planned_panel_count = len(treatment.sequence(ir))
+        sheet = _villain_sheet(
+            treatment, style, kits, renderer, root, raw_dir, report,
+            save_to_kits=bool(getattr(args, "save_villain_kit", False)),
+            reserve_budget=planned_panel_count,
+        ) if treatment.has_villain else None
         if sheet is not None:
             villain = (treatment.villain_name, treatment.villain_look, sheet)
         elif treatment.has_villain:
@@ -620,117 +776,68 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
         descriptions[villain[0]] = f"a villain creature: {villain[1]} (not a person)"
     panels_by_id = {p.get("id"): p for p in ir.get("panels", [])}
     checks: list[dict[str, Any]] = []
-    lettered: list[Image.Image] = []
+    lettered: list[Any] = []
     lettered_roles: list[str] = []
     flagged: list[str] = []
 
+    # Pass 1: give every planned panel an initial render + vision check before spending
+    # scarce budget on quality retries so failing early panels never starve the finale.
+    panel_states: list[dict[str, Any]] = []
     for request in requests:
-        final_path, final_check = None, None
-        for attempt in range(0, max(0, args.retries) + 1):
-            path = renderer.render_one(request, raw_dir, report, attempt_tag=f"retry{attempt}" if attempt else "")
-            if path is None:
-                break
-            try:
-                answer = ask(path, check_question(list(request.cast), descriptions))
-                speakers = [str(l.get("speaker")) for l in panels_by_id.get(request.panel_id, {}).get("lines", [])]
-                check = interpret(
-                    request.panel_id, list(request.cast), answer,
-                    tighten=lambda name, p=path: ask(p, TIGHT_QUESTION.format(name=name)),
-                    require_heads=speakers,
-                )
-            except VisionError as exc:
-                # The check could not run. That says nothing about the panel, so it is not
-                # regenerated (the first real render paid for 4 needless images this way);
-                # it is flagged for a human look instead.
-                from canon.panel_check import PanelCheck
+        path = renderer.render_one(request, raw_dir, report)
+        if path is None:
+            panel_states.append({"request": request, "path": None, "check": None, "vision_unavailable": False})
+            continue
+        panel = panels_by_id.get(request.panel_id, {})
+        check, vision_unavailable = _evaluate_panel(path, request, panel, descriptions, ask)
+        panel_states.append({"request": request, "path": path, "check": check, "vision_unavailable": vision_unavailable})
 
-                final_path = path
-                final_check = PanelCheck(panel_id=request.panel_id, problems=[f"vision check unavailable: {str(exc)[:160]}"])
-                break
-            final_path, final_check = path, check
-            if check.passed:
-                break
+    # Pass 2: spend remaining budget (if any) retrying panels that failed quality checks.
+    budget_skip_noted = False
+    for attempt in range(1, max(0, args.retries) + 1):
+        tag = f"retry{attempt}"
+        for state in panel_states:
+            if state["path"] is None or state["check"] is None or state["check"].passed or state["vision_unavailable"]:
+                continue
+            request = state["request"]
+            if not renderer.can_render(request, attempt_tag=tag):
+                if not budget_skip_noted:
+                    print(f"budget: {renderer.budget} images reached; skipping remaining quality retries")
+                    budget_skip_noted = True
+                continue
+            retry_path = renderer.render_one(request, raw_dir, report, attempt_tag=tag)
+            if retry_path is None:
+                continue
+            report.record_quality_retry()
+            panel = panels_by_id.get(request.panel_id, {})
+            retry_check, vision_unavailable = _evaluate_panel(retry_path, request, panel, descriptions, ask)
+            if vision_unavailable:
+                state["vision_unavailable"] = True
+                continue
+            if retry_check.passed or len(retry_check.problems) <= len(state["check"].problems):
+                state["path"] = retry_path
+                state["check"] = retry_check
+
+    # Pass 3: letter and export in original episode order.
+    for state in panel_states:
+        request = state["request"]
+        final_path, final_check = state["path"], state["check"]
         if final_path is None or final_check is None:
             flagged.append(f"{request.panel_id}: not rendered")
             continue
         report.rendered[request.panel_id] = final_path
-        checks.append(final_check.as_dict())
         if not final_check.passed:
             flagged.append(f"{request.panel_id}: {'; '.join(final_check.problems)}")
         panel = panels_by_id.get(request.panel_id, {})
-        lines = [(str(l.get("speaker", "")), str(l.get("text", ""))) for l in panel.get("lines", [])]
-        image, letter_report = letter_panel(
-            Image.open(final_path),
-            heads=final_check.heads,
-            free=final_check.free or [[0.05, 0.01, 0.95, 0.25]],
-            keep_out=final_check.keep_out,
-            caption=display_text(str(panel.get("caption", ""))),
-            lines=[(speaker, display_text(text)) for speaker, text in lines],
-            font_scale=PAGE_FONT_SCALE if treatment is not None else 1.0,
-            look=letter_look,
-            allow_expand=True,
-            allow_shorten=True,
+        image, check_entry = _letter_and_verify_panel(
+            final_path, final_check, request, panel,
+            treatment=treatment, letter_look=letter_look, ask=ask, out=out, flagged=flagged,
         )
-        if lines and letter_report.balloons:
-            # Letterer self-check (bake-off r2 + reel-k90): verify every tail aims cleanly
-            # at its speaker and no balloon/caption covers faces or protected acting.
-            speakers = ", ".join(sorted({speaker for speaker, _ in lines}))
-            misses: list[str] = []
-            occluded: list[str] = []
-            try:
-                tmp = out / "raw" / f"{request.panel_id}-lettered-check.jpg"
-                image.save(tmp, quality=85)
-                letter_eval = ask(tmp, LETTER_QUESTION.format(speakers=speakers))
-                misses = [str(m) for m in (letter_eval.get("misses") or []) if isinstance(m, str)]
-                occluded = [str(o) for o in (letter_eval.get("occluded") or []) if isinstance(o, str) and str(o).strip()]
-                tmp.unlink(missing_ok=True)
-            except VisionError:
-                misses = []
-                occluded = []
-            fixed_heads = dict(final_check.heads)
-            for name in misses:
-                key = next((k for k in fixed_heads if k.lower() == name.lower()), name)
-                try:
-                    tight = ask(final_path, TIGHT_QUESTION.format(name=key))
-                    from canon.panel_check import parse_head_box
-
-                    box = parse_head_box(tight)
-                    if box:
-                        fixed_heads[key] = box
-                except VisionError:
-                    pass
-            if misses:
-                image, letter_report = letter_panel(
-                    Image.open(final_path),
-                    heads=fixed_heads,
-                    free=final_check.free or [[0.05, 0.01, 0.95, 0.25]],
-                    keep_out=final_check.keep_out,
-                    caption=display_text(str(panel.get("caption", ""))),
-                    lines=[(speaker, display_text(text)) for speaker, text in lines],
-                    font_scale=PAGE_FONT_SCALE if treatment is not None else 1.0,
-                    look=letter_look,
-                    allow_expand=True,
-                    allow_shorten=True,
-                )
-                checks[-1]["heads"] = fixed_heads
-                checks[-1]["tail_misses_fixed"] = misses
-                try:
-                    tmp = out / "raw" / f"{request.panel_id}-lettered-recheck.jpg"
-                    image.save(tmp, quality=85)
-                    recheck = ask(tmp, LETTER_QUESTION.format(speakers=speakers))
-                    occluded = [str(o) for o in (recheck.get("occluded") or []) if isinstance(o, str) and str(o).strip()]
-                    tmp.unlink(missing_ok=True)
-                except VisionError:
-                    occluded = []
-            if occluded:
-                checks[-1]["lettering_occluded"] = occluded
-                flagged.append(f"{request.panel_id}: lettering occluded {'; '.join(occluded)}")
-        checks[-1]["lettering"] = letter_report.as_dict()
-        if not letter_report.complete:
-            flagged.append(f"{request.panel_id}: could not place {', '.join(letter_report.unplaced)}")
+        checks.append(check_entry)
         lettered.append(image)
         lettered_roles.append(str(panel.get("role", "filler")) if panel else "filler")
 
+    report.seconds = _time.time() - started
     write_render_manifest(out / "render-manifest.json", requests, report)
     if not lettered:
         print("nothing rendered:")
@@ -742,8 +849,9 @@ def render_command(args: argparse.Namespace, *, ctx: Any, default_dir: Callable[
     exports = export_episode(lettered, out_dir=out, title=title, ir=ir, style=style.key,
                              render_report=report.as_dict(), checks=checks,
                              roles=lettered_roles if treatment is not None else None)
+    retry_detail = f" ({report.quality_retries} quality, {report.transient_retries} transient)" if report.retries else ""
     print(f"rendered {len(lettered)}/{len(requests)} panels in {style.key}: {report.calls} new images, "
-          f"{report.cache_hits} from cache, {report.retries} retries")
+          f"{report.cache_hits} from cache, {report.retries} retries{retry_detail}")
     print(f"files: {out}")
     pages = sorted(k for k in exports.files if k.startswith("page-"))
     print(f"  {'pages':18} {len(pages)} (+ chapter.pdf)")

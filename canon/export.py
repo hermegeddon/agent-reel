@@ -202,9 +202,21 @@ def fit(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     return canvas
 
 
-def caption_draft(title: str, ir: Mapping[str, Any], *, hashtags: Sequence[str] = ("#HermesAgent",)) -> str:
+def caption_draft(
+    title: str,
+    ir: Mapping[str, Any],
+    *,
+    hashtags: Sequence[str] = ("#HermesAgent",),
+    rendered_ids: Sequence[str] | set[str] | None = None,
+) -> str:
     """A short post the owner can edit. Built from the episode's own captions only."""
-    captions = [str(p.get("caption", "")).strip() for p in ir.get("panels", []) if str(p.get("caption", "")).strip()]
+    panels = list(ir.get("panels", []))
+    rendered_set = {str(pid) for pid in rendered_ids} if rendered_ids else set()
+    if rendered_set:
+        matching = [p for p in panels if str(p.get("id")) in rendered_set]
+        if matching:
+            panels = matching
+    captions = [str(p.get("caption", "")).strip() for p in panels if str(p.get("caption", "")).strip()]
     body = captions[-1] if captions else ""
     lines = [title.strip()]
     if body:
@@ -291,7 +303,9 @@ def export_episode(
     while files["discord"].stat().st_size > DISCORD_MAX_BYTES and quality > 40:
         quality -= 12
         page.save(files["discord"], quality=quality, optimize=True)
-    draft = caption_draft(title, ir)
+    rendered_map = render_report.get("rendered")
+    rendered_ids = set(rendered_map.keys()) if isinstance(rendered_map, Mapping) and rendered_map else None
+    draft = caption_draft(title, ir, rendered_ids=rendered_ids)
     files["caption"] = out / "caption.txt"
     files["caption"].write_text(draft + "\n", encoding="utf-8")
     files["sidecar"] = out / "sidecar.json"

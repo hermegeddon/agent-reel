@@ -55,8 +55,14 @@ class RenderReport:
     cache_hits: int = 0
     calls: int = 0
     retries: int = 0
+    transient_retries: int = 0
+    quality_retries: int = 0
     failures: list[str] = field(default_factory=list)
     seconds: float = 0.0
+
+    def record_quality_retry(self) -> None:
+        self.quality_retries += 1
+        self.retries += 1
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -64,6 +70,8 @@ class RenderReport:
             "cache_hits": self.cache_hits,
             "calls": self.calls,
             "retries": self.retries,
+            "transient_retries": self.transient_retries,
+            "quality_retries": self.quality_retries,
             "failures": list(self.failures),
             "seconds": round(self.seconds, 1),
         }
@@ -83,8 +91,17 @@ class PanelRenderer:
         path = self.cache_dir / f"{key}.png"
         return path if path.is_file() else None
 
+    def _request_cache_key(self, request: PanelRequest, attempt_tag: str = "") -> str:
+        return request_key(request) + (f"-{attempt_tag}" if attempt_tag else "")
+
+    def is_cached(self, request: PanelRequest, *, attempt_tag: str = "") -> bool:
+        return self._cached(self._request_cache_key(request, attempt_tag)) is not None
+
+    def can_render(self, request: PanelRequest, *, attempt_tag: str = "") -> bool:
+        return self.is_cached(request, attempt_tag=attempt_tag) or self.calls_made < self.budget
+
     def render_one(self, request: PanelRequest, out_dir: Path, report: RenderReport, *, attempt_tag: str = "") -> Path | None:
-        key = request_key(request) + (f"-{attempt_tag}" if attempt_tag else "")
+        key = self._request_cache_key(request, attempt_tag)
         target = Path(out_dir) / f"{request.panel_id}{('-' + attempt_tag) if attempt_tag else ''}.png"
         cached = self._cached(key)
         if cached is not None:
@@ -103,6 +120,7 @@ class PanelRenderer:
                 produced = Path(self.generate(request.prompt, request.references, request.aspect))
             except RenderError as exc:
                 if exc.transient and attempt < self.max_retries and self.calls_made < self.budget:
+                    report.transient_retries += 1
                     report.retries += 1
                     self.sleep(delay)
                     delay *= 2
