@@ -73,6 +73,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="cap a strip to this many story panels (4 gives the social/README shape); 0 keeps all six",
     )
     plan.add_argument("--data-dir", default="", help="where to write artefacts")
+    plan.add_argument("--state-dir", default="", help="private planner state, outside evidence (default unchanged)")
     plan.add_argument(
         "--llm-url",
         default=None,
@@ -132,6 +133,8 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         _import_repo()
         from adapters.hermes.render_cli import register_render_cli
     register_render_cli(subs)
+    from adapters.hermes.weekly_cli import register_weekly_cli
+    register_weekly_cli(subs)
     subparser.set_defaults(func=reel_command)
 
 
@@ -247,8 +250,13 @@ def redaction_client(llm_url: str | None) -> Any:
     return OpenAICompatLLMClient(base_url=llm_url, model="auto")
 
 
-def reel_command(args: argparse.Namespace) -> int:
+def reel_command(args: argparse.Namespace, *, ctx: Any = None) -> int:
+    ctx = _CTX if ctx is None else ctx
     action = getattr(args, "reel_action", None)
+    if action == "weekly":
+        _import_repo()
+        from adapters.hermes.weekly_cli import weekly_command
+        return weekly_command(args, ctx=ctx)
     if action == "eval-grounding":
         return eval_grounding_command(args)
     if action in {"render", "kit", "sources", "book", "styles", "tones"}:
@@ -265,7 +273,7 @@ def reel_command(args: argparse.Namespace) -> int:
             return render_cli.styles_command(args, _default_data_dir)
         if action == "tones":
             return render_cli.tones_command(args, _default_data_dir)
-        return render_cli.render_command(args, ctx=_CTX, default_dir=_default_data_dir)
+        return render_cli.render_command(args, ctx=ctx, default_dir=_default_data_dir)
     if action != "plan":
         print("Usage: hermes reel plan --dry-run | render --plan-dir DIR | sources | styles | book | kit list|add|create|approve|contribute | eval-grounding")
         return 2
@@ -273,7 +281,7 @@ def reel_command(args: argparse.Namespace) -> int:
         print("This command only plans: pass --dry-run.")
         return 2
 
-    llm = ctx_llm()
+    llm = getattr(ctx, "llm", None)
     if llm is None:
         print("ctx.llm is unavailable in this process; run this through `hermes reel plan`.")
         return 1
@@ -337,6 +345,7 @@ def reel_command(args: argparse.Namespace) -> int:
 
     config = PipelineConfig(
         data_dir=data_dir,
+        state_dir=Path(args.state_dir).expanduser() if getattr(args, "state_dir", "") else None,
         days=args.days,
         since=since,
         until=until,

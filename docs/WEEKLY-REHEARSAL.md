@@ -1,0 +1,23 @@
+# Weekly Reel rehearsal
+
+**Offline safety checkpoint. Not installed, deployable, or qualified for live scheduling.** The normal `reel weekly` entry point refuses with exit 2 and `strict_writer_route_unavailable` before opening history, taking a claim, planning, or sending a model request. The explicitly injected strict writer used by tests is not a supported host capability or a CLI escape hatch.
+
+## What this checkpoint exercises
+
+The offline fixtures use synthetic history and fictional kits, the real Reel CLI and controller, and fake writer, image and vision transports. The run namespace `weekly-reel` identifies controller state, **not** a scheduler job. Use a fresh, private state root; do not copy receipts from another namespace.
+
+- State and local output live under `ROOT/weekly-reel/<ISO-week>/`; planner state lives at `ROOT/weekly-reel/planner-state/` so it stays separate from legacy planning and persists across weeks. The explicit history home must match the process's `HERMES_HOME`; history, assets and writable state roots must be disjoint, and the cast config cannot be inside the writable root.
+- Use an explicit timezone-aware occurrence; the key comes from its UTC ISO week. The input window is seven UTC dates ending on the occurrence's UTC date, not a rolling 168-hour window. A different occurrence or changed inputs under an existing run key refuse rather than replaying.
+- One atomic directory claim admits a single owner. `complete` and `no_story` return the existing receipt; a competing run returns `busy`. A hard kill may leave a claim behind; investigate rather than taking it over automatically. Under this checkpoint, empty-history success uses an exact zero-writer-call planner diagnostic, not a structured status. Other no-episode failures are not treated as success.
+- The receipt binds the cast bytes, asset inputs, planner-state path, history home, time window and explicit routes. Render recovery separately binds both the saved episode IR and the optional trace's presence and bytes. A missing or unapproved kit refuses before image spend. Restoring approval can resume the same unchanged saved plan; an ambiguous interrupted or failed render is not automatically replayed.
+- The rehearsal's render path is one anime episode in literal mode without fillers, with six image attempts and zero configured retries. This is not a cap on total writer or vision calls, or on monetary spend. The image route must explicitly name a model via `openai`, `gemini`, or `fal`. The host image tool and ComfyUI are not available through this launcher because this interface does not pin their effective route. No operational provider is selected here.
+- Output and receipts stay local. On a nonzero status, reconcile the existing receipt; do not fall back to raw `plan` or `render`. A completed receipt prevents repeat calls but does not re-verify finished output hashes. The preflight checks assume trusted private roots; they are not proof against hostile filesystem writers or power loss.
+
+The focused suite is `tests/test_weekly_launcher.py`, `tests/test_weekly_rehearsal.py`, and `tests/test_m2p3_render.py`. Run it in an isolated test environment with synthetic homes, provider networking denied, and installed host-tool discovery disabled. Do not use an installed plugin or a real profile for the rehearsal.
+
+## Before any live use
+
+1. Verify that the effective Hermes writer dispatcher can enforce a specific provider and model without fallback. Passing explicit overrides is not enough: the installed auxiliary route can substitute another provider or model. Prove refusal through the real dispatcher using inert failures before adding a production admission path.
+2. Provide a trusted handoff of the scheduler's intended occurrence and input window. The in-process execution identity does not cross into a CLI subprocess. Do not derive occurrence from wall-clock time, a prompt, or a guessed environment variable.
+3. Separately qualify the target runtime, no-story and interruption behavior, weekly-owned roots and reviewed cast/assets, actual image and vision routes, spending limits, and the acceptance of unedited output. Fake transports do not qualify live routing, visual quality, cancellation, or cost.
+4. Before touching one approved weekly job, preserve its exact original record and prompt privately, verify its owner and scheduler settings, and agree on rollback and first-run readback. Restore that exact record if rollback is needed; do not reconstruct it from this runbook. Leave every other job unchanged. Neither rollout nor rollback is authorized by this checkpoint.
